@@ -1,0 +1,43 @@
+import { randomUUID } from 'node:crypto'
+import { completeAI } from './aiGateway.service.js'
+
+export async function completeThroughRelay(options) {
+  const relayUrl = process.env.AI_RELAY_INTERNAL_URL
+  if (!relayUrl || process.env.AI_RELAY_SERVER === 'true') return completeAI(options)
+  const startTime = Date.now()
+  const route = options?.route || 'ai_call'
+  const controller = new AbortController()
+  // The route policy owns the provider deadline. This outer deadline only
+  // bounds waiting on the relay process and allows its configured 120s limit.
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs || 125000)
+  const requestId = typeof options.requestId === 'string' && options.requestId.trim() && options.requestId.length <= 128
+    ? options.requestId
+    : randomUUID()
+  try {
+    const response = await fetch(`${relayUrl.replace(/\/$/, '')}/internal/ai/v1/complete`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.AI_RELAY_SERVICE_TOKEN || ''}`,
+        'X-Request-Id': requestId,
+      },
+      body: JSON.stringify(options),
+      signal: controller.signal,
+    })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      const durationSec = ((Date.now() - startTime) / 1000).toFixed(2)
+      console.error(`[AI Relay] ❌ [${route}] thất bại sau ${durationSec}s: ${payload.error || 'AI relay request failed'}`)
+      const error = new Error(payload.error || 'AI relay request failed')
+      error.status = response.status
+      error.code = payload.code || 'AI_RELAY_ERROR'
+      error.attempts = payload.attempts
+      throw error
+    }
+    const durationSec = ((Date.now() - startTime) / 1000).toFixed(2)
+    console.log(`[AI Relay] ⏱️ [${route}] phản hồi thành công sau ${durationSec}s (${Date.now() - startTime}ms)`)
+    return payload.data || payload
+  } finally {
+    clearTimeout(timeout)
+  }
+}

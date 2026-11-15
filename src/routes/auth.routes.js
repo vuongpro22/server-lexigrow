@@ -1,0 +1,20 @@
+import { Router } from 'express'
+import { register, login, logout, getMe, googleAuth, forgotPassword, resetPassword, getAuthConfig, checkEmail, verifyEmail, resendVerification } from '../controllers/auth.controller.js'
+import { protect } from '../middleware/auth.middleware.js'
+import { authRegisterLimiter, authLoginLimiter, authVerifyLimiter, authResendLimiter, publicEmailLimiter } from '../middleware/rateLimit.middleware.js'
+
+const router = Router()
+
+router.post('/register', authRegisterLimiter, register)
+router.post('/login', authLoginLimiter, login)
+router.post('/logout', logout)
+router.post('/verify-email', authVerifyLimiter, verifyEmail)
+router.post('/resend-verify', authResendLimiter, resendVerification)
+router.get('/me', protect, getMe)
+router.post('/google', googleAuth)
+router.post('/forgot-password', publicEmailLimiter, authResendLimiter, forgotPassword)
+router.post('/reset-password', authVerifyLimiter, resetPassword)
+router.get('/config', getAuthConfig)
+router.post('/check-email', publicEmailLimiter, checkEmail)
+
+export default router

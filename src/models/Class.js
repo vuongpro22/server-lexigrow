@@ -1,0 +1,61 @@
+import mongoose from 'mongoose'
+
+const classSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: [true, 'Please add a class name'],
+    trim: true,
+    maxlength: [200, 'Class name cannot be more than 200 characters'],
+  },
+  description: {
+    type: String,
+    trim: true,
+    default: '',
+  },
+  schedule: {
+    type: String,
+    trim: true,
+    default: '',
+  },
+  status: {
+    type: String,
+    enum: ['active', 'draft', 'archived'],
+    default: 'active',
+  },
+  teacher: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+  },
+  students: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+  }],
+  code: {
+    type: String,
+    unique: true,
+    sparse: true,
+    trim: true,
+  },
+  pendingStudents: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+  }],
+}, {
+  timestamps: true,
+  toJSON: { virtuals: true },
+  toObject: { virtuals: true },
+})
+
+// Teacher dashboard and admin class list both scope by teacher then status.
+classSchema.index({ teacher: 1, status: 1, createdAt: -1 })
+
+classSchema.index({ students: 1 })
+
+// Virtual for student count
+classSchema.virtual('studentCount').get(function () {
+  return this.students ? this.students.length : 0
+})
+
+const Class = mongoose.model('Class', classSchema)
+export default Class

@@ -1,0 +1,366 @@
+import Assignment from '../models/Assignment.js'
+import Class from '../models/Class.js'
+import Essay from '../models/Essay.js'
+import LearningSession from '../models/LearningSession.js'
+import ErrorResponse from '../utils/ErrorResponse.js'
+import asyncHandler from '../utils/asyncHandler.js'
+export const validateAssignmentLearningSet = async (learningSetId) => {
+  if (!learningSetId) return null
+  return learningSetId
+}
+import { createManyNotifications, createNotification } from '../services/notification.service.js'
+
+const parseFutureDueDate = (value, allowPast = false) => {
+  const dueDate = new Date(value)
+  if (Number.isNaN(dueDate.getTime())) {
+    throw new ErrorResponse('Please provide a valid due date', 400)
+  }
+  if (!allowPast && dueDate <= new Date()) {
+    throw new ErrorResponse('Due date must be in the future', 400)
+  }
+  return dueDate
+}
+
+async function getAssignmentClass(assignment, teacherId) {
+  const classId = assignment.classId?._id || assignment.classId
+  if (!classId) return null
+  return Class.findOne({ _id: classId, teacher: teacherId })
+    .select('status')
+    .lean()
+}
+
+async function assertAssignmentClassAccess(assignment, teacherId, { write = false } = {}) {
+  const cls = await getAssignmentClass(assignment, teacherId)
+  if (!cls) {
+    throw new ErrorResponse('Not authorized', 403)
+  }
+  if (write && cls.status !== 'active') {
+    throw new ErrorResponse('Assignment is read-only while the class is not active', 409, 'CLASS_NOT_ACTIVE')
+  }
+  return cls
+}
+
+/**
+ * @desc    Create a new assignment for a class
+ * @route   POST /api/assignments
+ * @access  Private (teacher)
+ */
+export const createAssignment = asyncHandler(async (req, res) => {
+  const { title, description, dueDate, keywords, classId, status } = req.body
+  const validatedDueDate = parseFutureDueDate(dueDate)
+
+  if (status !== undefined && !['active', 'closed'].includes(status)) {
+    throw new ErrorResponse('Invalid assignment status', 400)
+  }
+  const assignmentStatus = status || 'active'
+
+  // Verify the class belongs to this teacher
+  const cls = await Class.findById(classId)
+  if (!cls) throw new ErrorResponse('Class not found', 404)
+  if (cls.teacher.toString() !== req.user._id.toString()) {
+    throw new ErrorResponse('Not authorized to create assignments for this class', 403)
+  }
+  if (cls.status === 'archived') {
+    throw new ErrorResponse('Cannot create assignments for an archived class', 400)
+  }
+
+  const learningSetId = req.body.learningSetId === undefined ? null : await validateAssignmentLearningSet(req.body.learningSetId)
+  const assignment = await Assignment.create({
+    learningSetId,
+    title,
+    description: description || '',
+    dueDate: validatedDueDate,
+    keywords: keywords || [],
+    classId,
+    teacher: req.user._id,
+    status: assignmentStatus,
+  })
+
+  // Send real-time notifications to all students in the class
+  if (cls.students && cls.students.length > 0) {
+    const notifications = cls.students.map(studentId => ({
+      recipient: studentId,
+      sender: req.user._id,
+      title: 'New Assignment Assigned',
+      message: `Teacher ${req.user.name} has posted a new assignment: "${title}" in class "${cls.name}".`,
+      type: 'assignment',
+      link: `/student/class/${classId}`,
+    }))
+
+    createManyNotifications(notifications).catch(err => {
+      console.error('Failed to send assignment notifications:', err.message)
+    })
+  }
+
+  res.status(201).json({ success: true, data: assignment })
+})
+
+/**
+ * @desc    Get all assignments for a specific class (teacher view)
+ * @route   GET /api/assignments?classId=xxx
+ * @access  Private (teacher)
+ */
+export const getAssignmentsByClass = asyncHandler(async (req, res) => {
+  const { classId } = req.query
+
+  let query = {}
+
+  if (classId) {
+    // Verify ownership or enrollment
+    const cls = await Class.findById(classId)
+    if (!cls) throw new ErrorResponse('Class not found', 404)
+
+    if (req.user.role === 'teacher') {
+      if (cls.teacher.toString() !== req.user._id.toString()) {
+        throw new ErrorResponse('Not authorized to view assignments for this class', 403)
+      }
+    } else if (req.user.role === 'student') {
+      const isEnrolled = cls.students?.some(studentId => studentId.toString() === req.user._id.toString())
+      if (!isEnrolled) {
+        throw new ErrorResponse('Not authorized to view assignments for this class', 403)
+      }
+    }
+    query.classId = classId
+  } else {
+    // If no classId provided, allow teachers to view all their assignments
+    if (req.user.role === 'teacher') {
+      query.teacher = req.user._id
+    } else {
+      throw new ErrorResponse('Please provide a classId query parameter', 400)
+    }
+  }
+
+  const assignments = await Assignment.find(query)
+    .populate('classId', 'name code students')
+    .sort({ createdAt: -1 })
+
+  // Calculate submission counts for each assignment
+  const assignmentIds = assignments.map(a => a._id)
+  const submissionsCountMap = {}
+
+  if (assignmentIds.length > 0) {
+    const essayCounts = await Essay.aggregate([
+      {
+        $match: {
+          $or: [
+            { assignment: { $in: assignmentIds } },
+            { assignmentId: { $in: assignmentIds } }
+          ],
+          status: { $ne: 'draft' }
+        }
+      },
+      {
+        $group: {
+          _id: { $ifNull: ['$assignment', '$assignmentId'] },
+          count: { $sum: 1 }
+        }
+      }
+    ])
+    essayCounts.forEach(item => {
+      if (item._id) {
+        submissionsCountMap[item._id.toString()] = item.count
+      }
+    })
+  }
+
+  const data = assignments.map(a => {
+    const obj = a.toObject({ virtuals: true })
+    obj.submissionCount = submissionsCountMap[a._id.toString()] || 0
+    return obj
+  })
+
+  res.status(200).json({ success: true, count: data.length, data })
+})
+
+/**
+ * @desc    Get all active assignments for the current student (inbox)
+ * @route   GET /api/assignments/inbox
+ * @access  Private (student)
+ */
+export const getAssignmentInbox = asyncHandler(async (req, res) => {
+  // Step 1: Find all classes the student is enrolled in
+  const enrolledClasses = await Class.find({ students: req.user._id }).select('_id')
+  const classIds = enrolledClasses.map(c => c._id)
+
+  if (classIds.length === 0) {
+    return res.status(200).json({ success: true, count: 0, data: [] })
+  }
+
+  // Step 2: Find active assignments for those classes
+  const assignments = await Assignment.find({
+    classId: { $in: classIds },
+    status: 'active',
+  })
+    .populate('classId', 'name')
+    .populate('teacher', 'name')
+    .sort({ dueDate: 1 }) // Nearest deadline first
+
+  res.status(200).json({ success: true, count: assignments.length, data: assignments })
+})
+
+/**
+ * @desc    Get a single assignment by ID
+ * @route   GET /api/assignments/:id
+ * @access  Private (teacher, student)
+ */
+export const getAssignmentById = asyncHandler(async (req, res) => {
+  const assignment = await Assignment.findById(req.params.id)
+    .populate('classId', 'name students')
+    .populate('teacher', 'name')
+
+  if (!assignment) throw new ErrorResponse('Assignment not found', 404)
+
+  // Authorization check
+  if (req.user.role === 'teacher') {
+    await assertAssignmentClassAccess(assignment, req.user._id)
+  } else if (req.user.role === 'student') {
+    // Student must be enrolled in the assignment's class
+    const cls = await Class.findById(assignment.classId._id)
+    const isEnrolled = cls?.students?.some(s => s.toString() === req.user._id.toString())
+    if (!isEnrolled) throw new ErrorResponse('Not authorized', 403)
+  }
+
+  res.status(200).json({ success: true, data: assignment })
+})
+
+/**
+ * @desc    Update an assignment
+ * @route   PUT /api/assignments/:id
+ * @access  Private (teacher, owner)
+ */
+export const updateAssignment = asyncHandler(async (req, res) => {
+  const assignment = await Assignment.findById(req.params.id)
+  if (!assignment) throw new ErrorResponse('Assignment not found', 404)
+  await assertAssignmentClassAccess(assignment, req.user._id, { write: true })
+
+  const { title, description, dueDate, keywords, status } = req.body
+  if (req.body.learningSetId !== undefined) assignment.learningSetId = await validateAssignmentLearningSet(req.body.learningSetId)
+  if (title !== undefined) assignment.title = title
+  if (description !== undefined) assignment.description = description
+  if (dueDate !== undefined) {
+    const parsedDueDate = new Date(dueDate)
+    const unchanged = !Number.isNaN(parsedDueDate.getTime())
+      && assignment.dueDate
+      && parsedDueDate.getTime() === new Date(assignment.dueDate).getTime()
+    // Older clients resend the current (possibly already overdue) deadline.
+    // Treat it as unchanged instead of rejecting an otherwise valid edit.
+    if (!unchanged) assignment.dueDate = parseFutureDueDate(dueDate)
+  }
+  if (keywords !== undefined) assignment.keywords = keywords
+  if (status !== undefined) assignment.status = status
+
+  await assignment.save()
+
+  // Send real-time notifications to all students in the class about the update
+  const cls = await Class.findById(assignment.classId)
+  if (cls && cls.students && cls.students.length > 0) {
+    const notifications = cls.students.map(studentId => ({
+      recipient: studentId,
+      sender: req.user._id,
+      title: 'Assignment Updated',
+      message: `Teacher ${req.user.name} has updated the assignment: "${assignment.title}" in class "${cls.name}".`,
+      type: 'assignment',
+      link: `/student/class/${assignment.classId}`,
+    }))
+
+    createManyNotifications(notifications).catch(err => {
+      console.error('Failed to send assignment update notifications:', err.message)
+    })
+  }
+
+  // Send a self-notification to the teacher to confirm successful update via notification bell toast
+  createNotification({
+    recipient: req.user._id,
+    sender: req.user._id,
+    title: 'Assignment Updated',
+    message: `Assignment "${assignment.title}" has been updated successfully.`,
+    type: 'assignment',
+    link: `/teacher/assignment/${assignment._id}`,
+  }).catch(err => {
+    console.error('Failed to send teacher self update notification:', err.message)
+  })
+
+  res.status(200).json({ success: true, data: assignment })
+})
+
+/**
+ * @desc    Delete an assignment
+ * @route   DELETE /api/assignments/:id
+ * @access  Private (teacher, owner)
+ */
+export const deleteAssignment = asyncHandler(async (req, res) => {
+  const assignment = await Assignment.findById(req.params.id)
+  if (!assignment) throw new ErrorResponse('Assignment not found', 404)
+  await assertAssignmentClassAccess(assignment, req.user._id, { write: true })
+
+  // Keep historical submissions and learning sessions, but detach them from
+  // the assignment being removed so no document keeps a dead reference.
+  await Promise.all([
+    Essay.updateMany(
+      { assignment: assignment._id },
+      { $set: { assignment: null } },
+    ),
+    LearningSession.updateMany(
+      { assignment: assignment._id },
+      { $set: { assignment: null } },
+    ),
+  ])
+
+  await assignment.deleteOne()
+  res.status(200).json({ success: true, message: 'Assignment deleted' })
+})
+
+/**
+ * @desc    Get all essays submitted for an assignment
+ * @route   GET /api/assignments/:id/submissions
+ * @access  Private (teacher)
+ */
+export const getAssignmentSubmissions = asyncHandler(async (req, res) => {
+  const assignment = await Assignment.findById(req.params.id)
+  if (!assignment) throw new ErrorResponse('Assignment not found', 404)
+  await assertAssignmentClassAccess(assignment, req.user._id)
+
+  // Find submitted essays linked to this assignment
+  // status: { $ne: 'draft' } -> only show submitted or reviewed essays
+  const submissions = await Essay.find({ 
+    assignment: req.params.id,
+    status: { $ne: 'draft' }
+  })
+    .populate('student', 'name email')
+    .sort({ submittedAt: -1 })
+    .lean()
+
+  // Enrich with score: prefer ManualFeedback (submitted) → AIAnalysis → null
+  const AIAnalysis = (await import('../models/AIAnalysis.js')).default
+  const ManualFeedback = (await import('../models/ManualFeedback.js')).default
+  const essayIds = submissions.map(s => s._id)
+
+  const [analyses, manualFeedbacks] = await Promise.all([
+    AIAnalysis.find({ essay: { $in: essayIds } }).lean(),
+    ManualFeedback.find({ essay: { $in: essayIds }, status: 'submitted' }).lean(),
+  ])
+
+  const analysisMap = {}
+  analyses.forEach(a => {
+    analysisMap[a.essay.toString()] = a.overallScore
+  })
+
+  // Build manual score map: average of 4 criteria (1-10 each)
+  const manualScoreMap = {}
+  manualFeedbacks.forEach(fb => {
+    const { grammar = 0, vocabulary = 0, coherence = 0, complexity = 0 } = fb.scores || {}
+    const avg = Math.round(((Number(grammar) + Number(vocabulary) + Number(coherence) + Number(complexity)) / 4) * 10) / 10
+    manualScoreMap[fb.essay.toString()] = avg
+  })
+
+  const enrichedSubmissions = submissions.map(sub => {
+    const id = sub._id.toString()
+    // Manual feedback (submitted by teacher) takes priority over AI score
+    const score = manualScoreMap[id] !== undefined
+      ? manualScoreMap[id]
+      : (analysisMap[id] !== undefined ? analysisMap[id] : null)
+    return { ...sub, score }
+  })
+
+  res.status(200).json({ success: true, count: enrichedSubmissions.length, data: enrichedSubmissions })
+})
