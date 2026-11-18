@@ -67,6 +67,17 @@ const publicAccount = (account) => ({
   lastErrorCode: account.lastErrorCode,
 })
 
+const publicModel = (model) => ({
+  _id: model._id,
+  account: model.account,
+  modelId: model.modelId,
+  displayName: model.displayName,
+  capabilities: model.capabilities,
+  inputCostPerMillionUsd: model.inputCostPerMillionUsd,
+  outputCostPerMillionUsd: model.outputCostPerMillionUsd,
+  enabled: model.enabled,
+})
+
 export const listAIProviders = asyncHandler(async (req, res) => {
   const accounts = await AIProviderAccount.find().select('+encryptedApiKey').sort({ priority: 1, name: 1 }).lean()
   res.json({ success: true, data: accounts.map(publicAccount) })
@@ -249,17 +260,6 @@ export const deleteAIProvider = asyncHandler(async (req, res) => {
   res.json({ success: true, data: null })
 })
 
-const publicModel = (model) => ({
-  _id: model._id,
-  account: model.account,
-  modelId: model.modelId,
-  displayName: model.displayName,
-  capabilities: model.capabilities,
-  inputCostPerMillionUsd: model.inputCostPerMillionUsd,
-  outputCostPerMillionUsd: model.outputCostPerMillionUsd,
-  enabled: model.enabled,
-})
-
 export const listAIModels = asyncHandler(async (req, res) => {
   const models = await AIProviderModel.find().populate('account', 'name provider baseUrl enabled').sort({ modelId: 1 }).lean()
   res.json({ success: true, data: models.map(publicModel) })
@@ -383,7 +383,7 @@ export const updateAICombo = asyncHandler(async (req, res) => {
   if (maxCostUsd !== undefined) combo.maxCostUsd = maxCostUsd
   if (enabled !== undefined) combo.enabled = Boolean(enabled)
   if (active !== undefined) combo.active = Boolean(active)
-  if (combo.active) await validateComboCandidates(combo.candidates)
+  if (combo.active && candidates === undefined) await validateComboCandidates(combo.candidates)
   if (combo.active && combo.routes.length) await AIModelCombo.updateMany({ _id: { $ne: combo._id }, routes: { $in: combo.routes } }, { $set: { active: false } })
   combo.version += 1
   await combo.save()

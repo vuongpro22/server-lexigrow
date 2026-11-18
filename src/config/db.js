@@ -1,3 +1,7 @@
+import { webcrypto } from 'node:crypto'
+if (!globalThis.crypto) {
+  globalThis.crypto = webcrypto
+}
 import mongoose from 'mongoose'
 import PendingUser from '../models/PendingUser.js'
 import { syncPendingUserExpiryIndexes } from '../utils/pendingUserIndexes.js'

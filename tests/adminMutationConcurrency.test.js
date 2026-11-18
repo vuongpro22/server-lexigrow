@@ -12,7 +12,8 @@ import Class from '../src/models/Class.js'
 import AdminMutationLock from '../src/models/AdminMutationLock.js'
 import Notification from '../src/models/Notification.js'
 import { respondParentRequest } from '../src/controllers/notification.controller.js'
-import { updateUserRole, updateUserStatus, deleteUser } from '../src/controllers/admin.user.controller.js'
+import { updateUserRole, updateUserStatus, resetUserPassword, deleteUser } from '../src/controllers/admin.user.controller.js'
+import { forceReleaseAdminMutationLock } from '../src/services/adminMutationLock.service.js'
 
 let mongo, otherConnection, admins
 const app = express()
@@ -21,6 +22,7 @@ app.use(express.json())
 app.use((req, res, next) => { req.user = admins[Number(req.headers['x-actor'] || 0)]; next() })
 app.patch('/users/:id/role', updateUserRole)
 app.patch('/users/:id/status', updateUserStatus)
+app.post('/users/:id/reset-password', resetUserPassword)
 app.delete('/users/:id', deleteUser)
 app.post('/notifications/:id/respond', respondParentRequest)
 app.use((error, req, res, next) => { void next; res.status(error.statusCode || 500).json({ message: error.message }) })
@@ -145,5 +147,37 @@ describe('AD-01 admin membership concurrency on standalone MongoDB', () => {
     const updated = await findById(parent._id)
     expect(updated.role).toBe('admin')
     expect(updated.accountStatus).toBe('active')
+  })
+
+  it('serializes resetUserPassword with adminMutationLock and supports forceReleaseAdminMutationLock recovery', async () => {
+    const student = await User.create({ name: 'Student', email: 'student@test.example', password: 'Password123!', role: 'student' })
+    const collection = otherConnection.collection(AdminMutationLock.collection.name)
+    await collection.insertOne({ _id: 'admin-user-mutations', owner: 'crashed-worker', acquiredAt: new Date(0) })
+
+    await request(app).post(`/users/${student.id}/reset-password`).send({ newPassword: 'NewPassword123!' }).expect(409)
+
+    const released = await forceReleaseAdminMutationLock()
+    expect(released).toMatchObject({ released: true, previousOwner: 'crashed-worker' })
+
+    await request(app).post(`/users/${student.id}/reset-password`).send({ newPassword: 'NewPassword123!' }).expect(200)
+    expect(await AdminMutationLock.countDocuments()).toBe(0)
+  })
+
+  it('refuses to force-release a lock that may still belong to a running mutation', async () => {
+    const collection = otherConnection.collection(AdminMutationLock.collection.name)
+    await collection.insertOne({ _id: 'admin-user-mutations', owner: 'live-worker', acquiredAt: new Date() })
+
+    await expect(forceReleaseAdminMutationLock()).rejects.toMatchObject({ statusCode: 409, code: 'LOCK_NOT_STALE' })
+    expect(await AdminMutationLock.findById('admin-user-mutations').lean()).toMatchObject({ owner: 'live-worker' })
+
+    await collection.deleteOne({ _id: 'admin-user-mutations' })
+  })
+
+  it('treats a legacy lock without acquiredAt as stale and reports no-op when nothing is held', async () => {
+    const collection = otherConnection.collection(AdminMutationLock.collection.name)
+    await collection.insertOne({ _id: 'admin-user-mutations', owner: 'legacy-worker' })
+
+    await expect(forceReleaseAdminMutationLock()).resolves.toMatchObject({ released: true, previousOwner: 'legacy-worker' })
+    await expect(forceReleaseAdminMutationLock()).resolves.toMatchObject({ released: false, previousOwner: null })
   })
 })

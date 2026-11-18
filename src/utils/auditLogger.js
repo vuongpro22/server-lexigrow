@@ -24,6 +24,7 @@ export const logAction = async (userId, action, targetType, targetId, details = 
     }
     await AuditLog.create({
       user: userId,
+      actorType: 'user',
       actorName: actor?.name || '',
       actorEmail: actor?.email || '',
       actorRole: actor?.role || '',
@@ -34,5 +35,26 @@ export const logAction = async (userId, action, targetType, targetId, details = 
     })
   } catch (err) {
     console.error('[AuditLog] Failed to create audit log:', err.message)
+  }
+}
+
+/**
+ * Log a system/scheduler-initiated action without a human user actor.
+ */
+export const logSystemAction = async (action, targetType, targetId, details = {}) => {
+  try {
+    await AuditLog.create({
+      user: null,
+      actorType: 'system',
+      actorName: 'System',
+      actorEmail: '',
+      actorRole: 'system',
+      action,
+      targetType,
+      targetId: targetId ? targetId.toString() : null,
+      details,
+    })
+  } catch (err) {
+    console.error('[AuditLog] Failed to create system audit log:', err.message)
   }
 }

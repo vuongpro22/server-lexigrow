@@ -157,8 +157,8 @@ export const adminDeletePlan = asyncHandler(async (req, res) => {
   // Hide it instead (isActive = false), which the pricing and payment paths
   // already respect.
   const [subscriptionCount, transactionCount] = await Promise.all([
-    Subscription.countDocuments({ plan: plan._id }),
-    PaymentTransaction.countDocuments({ plan: plan._id }),
+    Subscription.countDocuments({ $or: [{ plan: plan._id }, { planSlug: plan.slug }] }),
+    PaymentTransaction.countDocuments({ $or: [{ plan: plan._id }, { planSlug: plan.slug }] }),
   ])
 
   if (subscriptionCount > 0 || transactionCount > 0) {
@@ -174,6 +174,24 @@ export const adminDeletePlan = asyncHandler(async (req, res) => {
   await logAction(req.user._id, 'ADMIN_DELETE_PLAN', 'SubscriptionPlan', plan._id, { slug: plan.slug })
 
   res.status(200).json({ success: true, message: 'Đã xóa gói cước thành công.' })
+})
+
+/**
+ * @desc    Admin: Get summary revenue & paid transaction count without fetching rows
+ * @route   GET /api/admin/pricing/stats
+ * @access  Private (Admin)
+ */
+export const adminGetPricingStats = asyncHandler(async (req, res) => {
+  const revenueStats = await PaymentTransaction.aggregate([
+    { $match: { status: 'PAID' } },
+    { $group: { _id: null, totalRevenue: { $sum: '$amount' }, count: { $sum: 1 } } },
+  ])
+
+  res.status(200).json({
+    success: true,
+    totalRevenue: revenueStats[0]?.totalRevenue || 0,
+    paidCount: revenueStats[0]?.count || 0,
+  })
 })
 
 /**
@@ -278,7 +296,11 @@ export const adminGrantSubscription = asyncHandler(async (req, res) => {
   if (plan.tier === 'free') throw new ErrorResponse('Không thể cấp thủ công gói miễn phí.', 400, 'PLAN_FREE')
   if (plan.targetRole !== user.role) throw new ErrorResponse('Gói cước không phù hợp vai trò người dùng.', 400, 'PLAN_ROLE_MISMATCH')
 
-  const idempotencyKey = String(req.get('Idempotency-Key') || '').trim().slice(0, 200) || null
+  const rawIdempotencyKey = String(req.get('Idempotency-Key') || '').trim()
+  if (rawIdempotencyKey.length > 200) {
+    throw new ErrorResponse('Idempotency-Key không được vượt quá 200 ký tự.', 400, 'IDEMPOTENCY_KEY_TOO_LONG')
+  }
+  const idempotencyKey = rawIdempotencyKey || null
   const requestFingerprint = createHash('sha256')
     .update(JSON.stringify({ actorId: String(req.user._id), userId: String(user._id), planId: String(plan._id), days }))
     .digest('hex')

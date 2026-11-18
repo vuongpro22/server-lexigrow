@@ -7,6 +7,11 @@ const sendEmail = async (options) => {
     secure: process.env.SMTP_SECURE === 'true',
     disableFileAccess: true,
     disableUrlAccess: true,
+    // Nodemailer's defaults (2 min connect, 10 min socket) let one unreachable
+    // SMTP host hang the request that is waiting on this email.
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 20_000,
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS,

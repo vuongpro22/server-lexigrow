@@ -6,7 +6,8 @@ import {
   getConfigs,
   updateConfigs,
   getAILogs,
-  getAIMonitoringAnalytics
+  getAIMonitoringAnalytics,
+  forceReleaseMutationLock,
 } from '../controllers/admin.controller.js'
 import {
   getUsers,
@@ -49,6 +50,7 @@ router.use(adminLimiter)
 router.get('/logs', getAuditLogs)
 router.get('/analytics', getSystemAnalytics)
 router.post('/logs/seed', devOnly, seedMockData)
+router.delete('/mutation-lock', forceReleaseMutationLock)
 
 // ── Config routes ─────────────────────────────────────────
 router.get('/config', getConfigs)

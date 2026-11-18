@@ -81,7 +81,7 @@ import User from '../src/models/User.js'
 import Essay from '../src/models/Essay.js'
 import Class from '../src/models/Class.js'
 import AIAnalysis from '../src/models/AIAnalysis.js'
-import { logAction } from '../src/utils/auditLogger.js'
+import { logAction, logSystemAction } from '../src/utils/auditLogger.js'
 
 describe('Audit Logs & Analytics API', () => {
   beforeEach(() => {
@@ -103,6 +103,20 @@ describe('Audit Logs & Analytics API', () => {
     it('should not log if userId is not provided', async () => {
       await logAction(null, 'CREATE_CLASS', 'Class', 'class_456')
       expect(AuditLog.create).not.toHaveBeenCalled()
+    })
+
+    it('should log system-initiated events via logSystemAction without a userId', async () => {
+      await logSystemAction('RECONCILE_SUBSCRIPTIONS', 'Subscription', 'sub_99', { checked: 5 })
+      expect(AuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+        user: null,
+        actorType: 'system',
+        actorName: 'System',
+        actorRole: 'system',
+        action: 'RECONCILE_SUBSCRIPTIONS',
+        targetType: 'Subscription',
+        targetId: 'sub_99',
+        details: { checked: 5 },
+      }))
     })
   })
 

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import User from '../src/models/User.js'
 import ParentStudentLink from '../src/models/ParentStudentLink.js'
 import SubscriptionPlan from '../src/models/SubscriptionPlan.js'
@@ -6,7 +6,7 @@ import Subscription from '../src/models/Subscription.js'
 import PaymentTransaction from '../src/models/PaymentTransaction.js'
 import { createPayOSPaymentLink } from '../src/services/payos.service.js'
 import { getUserEffectiveTier } from '../src/services/tier.service.js'
-import { createPayment, getChildSubscription, getMyPaymentStatus } from '../src/controllers/payment.controller.js'
+import { createPayment, getChildSubscription, getMyPaymentStatus, resolveClientUrl } from '../src/controllers/payment.controller.js'
 
 vi.mock('../src/models/User.js', () => ({ default: { findById: vi.fn(), findOne: vi.fn() } }))
 vi.mock('../src/models/ParentStudentLink.js', () => ({ default: { findOne: vi.fn() } }))
@@ -217,5 +217,65 @@ describe('Parent purchases a plan for a linked child', () => {
         beneficiary: expect.objectContaining({ _id: child._id }),
       }),
     }))
+  })
+})
+
+describe('resolveClientUrl for PayOS redirects', () => {
+  const originalClientUrl = process.env.CLIENT_URL
+
+  afterEach(() => {
+    if (originalClientUrl === undefined) delete process.env.CLIENT_URL
+    else process.env.CLIENT_URL = originalClientUrl
+  })
+
+  it('uses configured non-localhost CLIENT_URL without trailing slash', () => {
+    process.env.CLIENT_URL = 'https://lexigrow.id.vn/'
+    expect(resolveClientUrl({ headers: { host: 'api.lexigrow.id.vn' } })).toBe('https://lexigrow.id.vn')
+  })
+
+  it('uses the request domain when CLIENT_URL is missing or left as localhost on production', () => {
+    process.env.CLIENT_URL = 'http://localhost:5173'
+    const prodReq = {
+      headers: {
+        origin: 'https://lexigrow.id.vn',
+        host: 'lexigrow.id.vn',
+      },
+    }
+    expect(resolveClientUrl(prodReq)).toBe('https://lexigrow.id.vn')
+
+    delete process.env.CLIENT_URL
+    const proxiedReq = {
+      protocol: 'http',
+      headers: {
+        host: 'lexigrow.id.vn',
+        'x-forwarded-proto': 'https',
+      },
+    }
+    expect(resolveClientUrl(proxiedReq)).toBe('https://lexigrow.id.vn')
+  })
+
+  it('ignores a spoofed Origin header whose host does not match the request host', () => {
+    delete process.env.CLIENT_URL
+    const req = {
+      protocol: 'http',
+      headers: {
+        origin: 'https://evil.example',
+        host: 'lexigrow.id.vn',
+        'x-forwarded-proto': 'https',
+      },
+    }
+    expect(resolveClientUrl(req)).toBe('https://lexigrow.id.vn')
+  })
+
+  it('keeps localhost CLIENT_URL during local development', () => {
+    process.env.CLIENT_URL = 'http://localhost:5173'
+    const localReq = {
+      protocol: 'http',
+      headers: {
+        origin: 'http://localhost:5173',
+        host: 'localhost:5000',
+      },
+    }
+    expect(resolveClientUrl(localReq)).toBe('http://localhost:5173')
   })
 })

@@ -179,4 +179,42 @@ describe('serialized teacher quota writes', () => {
     expect(succeeded.next).not.toHaveBeenCalled()
     expect(classRows.get('one').students).toEqual(['retry'])
   })
+
+  it('names the target teacher when they have no active plan', async () => {
+    classRows.set('a', { _id: 'a', teacher: 'old-a', status: 'active', students: [], pendingStudents: [] })
+    Subscription.findOne.mockReturnValue({ sort: vi.fn().mockResolvedValue(null) })
+    User.findOne.mockImplementation(async query => query.role
+      ? { _id: query._id, role: 'teacher', accountStatus: 'active', name: 'No Plan Teacher' }
+      : { _id: query._id, role: 'teacher', accountStatus: 'active' })
+
+    const { next } = await waitForNext((res, n) => updateClassByAdmin(
+      { user: { _id: 'admin' }, params: { id: 'a' }, body: { teacherId: 'target' } }, res, n,
+    ))
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({
+      statusCode: 403,
+      code: 'TEACHER_HAS_NO_PLAN',
+      message: expect.stringContaining('No Plan Teacher'),
+    }))
+    expect(classRows.get('a').teacher).toBe('old-a')
+  })
+
+  it('names the target teacher when their plan is out of slots', async () => {
+    classRows.set('a', { _id: 'a', teacher: 'old-a', status: 'active', students: [], pendingStudents: [] })
+    // Subscription is present but the plan allows one class and the target
+    // already owns one, so only the class cap can refuse this save.
+    classRows.set('b', { _id: 'b', teacher: 'target', status: 'active', students: [], pendingStudents: [] })
+    User.findOne.mockImplementation(async query => ({ _id: query._id, role: 'teacher', accountStatus: 'active', name: 'Full Teacher' }))
+
+    const { next } = await waitForNext((res, n) => updateClassByAdmin(
+      { user: { _id: 'admin' }, params: { id: 'a' }, body: { teacherId: 'target' } }, res, n,
+    ))
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({
+      statusCode: 403,
+      code: 'TEACHER_QUOTA_EXCEEDED',
+      message: expect.stringContaining('Full Teacher'),
+    }))
+    expect(classRows.get('a').teacher).toBe('old-a')
+  })
 })

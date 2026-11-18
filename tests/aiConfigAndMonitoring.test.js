@@ -130,6 +130,16 @@ describe('AI Config & Monitoring API', () => {
 
       expect(mockSave).not.toHaveBeenCalled()
     })
+
+    it('returns 422 when updating an unknown config key instead of silently succeeding', async () => {
+      Config.findOne.mockResolvedValue(null)
+      const res = await request(app)
+        .put('/api/admin/config')
+        .send({ settings: [{ key: 'NON_EXISTENT_CONFIG_KEY', value: 'true' }] })
+        .expect(422)
+
+      expect(res.body.error || res.body.message).toContain('NON_EXISTENT_CONFIG_KEY')
+    })
   })
 
   describe('GET /api/admin/ai/logs', () => {

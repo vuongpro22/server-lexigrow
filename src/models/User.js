@@ -101,6 +101,7 @@ const userSchema = new mongoose.Schema({
   statusNote: {
     type: String,
     default: '',
+    maxlength: [500, 'Status note cannot be more than 500 characters'],
   },
 }, {
   timestamps: true,

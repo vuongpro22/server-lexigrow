@@ -134,6 +134,66 @@ export const getChildSubscription = asyncHandler(async (req, res) => {
   })
 })
 
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
+
+function normalizeHttpOrigin(value) {
+  if (!value || typeof value !== 'string') return null
+  try {
+    const parsed = new URL(value.trim())
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
+function isLocalOrigin(origin) {
+  try {
+    return LOCAL_HOSTNAMES.has(new URL(origin).hostname.toLowerCase())
+  } catch {
+    return true
+  }
+}
+
+function getHeader(req, name) {
+  if (typeof req?.get === 'function') return req.get(name) || ''
+  return req?.headers?.[name.toLowerCase()] || ''
+}
+
+export function resolveClientUrl(req) {
+  const configured = normalizeHttpOrigin(process.env.CLIENT_URL)
+  if (configured && !isLocalOrigin(configured)) {
+    return configured
+  }
+
+  const rawHost = getHeader(req, 'host').split(',')[0].trim()
+  const originHeader = normalizeHttpOrigin(getHeader(req, 'origin'))
+  let requestOrigin = null
+
+  if (originHeader) {
+    try {
+      const parsedOrigin = new URL(originHeader)
+      if (!rawHost || parsedOrigin.host.toLowerCase() === rawHost.toLowerCase()) {
+        requestOrigin = parsedOrigin.origin
+      }
+    } catch {
+      // Ignore invalid origin
+    }
+  }
+
+  if (!requestOrigin && rawHost) {
+    const forwardedProto = getHeader(req, 'x-forwarded-proto').split(',')[0].trim().toLowerCase()
+    const protocol = forwardedProto === 'https' || req?.protocol === 'https' ? 'https' : 'http'
+    requestOrigin = normalizeHttpOrigin(`${protocol}://${rawHost}`)
+  }
+
+  if (requestOrigin && (!configured || !isLocalOrigin(requestOrigin))) {
+    return requestOrigin
+  }
+
+  return configured || 'http://localhost:5173'
+}
+
 /**
  * @desc    Create a PayOS payment link for subscription
  * @route   POST /api/payments/create-payment-link
@@ -190,7 +250,7 @@ export const createPayment = asyncHandler(async (req, res) => {
   // and unique enough without DB lookup for concurrent requests
   const orderCode = Date.now() * 1000 + Math.floor(Math.random() * 1000)
 
-  const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173'
+  const clientUrl = resolveClientUrl(req)
   const returnUrl = `${clientUrl}/payment/success?orderCode=${orderCode}`
   const cancelUrl = `${clientUrl}/payment/cancel?orderCode=${orderCode}`
 

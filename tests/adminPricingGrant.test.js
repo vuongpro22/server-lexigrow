@@ -328,6 +328,21 @@ describe('adminGrantSubscription — Idempotency-Key replay', () => {
       expect.objectContaining({ idempotencyKey: 'key-3' })
     )
   })
+
+  it('rejects an Idempotency-Key longer than 200 characters instead of truncating it', async () => {
+    mocks.userFindOne.mockResolvedValue({ _id: 'user_1', email: 'student@example.com', role: 'student', accountStatus: 'active' })
+    mocks.planFindOne.mockResolvedValue(VALID_PLAN)
+    const next = vi.fn()
+
+    await adminGrantSubscription(
+      mockReq({ userId: 'student@example.com', planSlug: 'pro' }, { 'idempotency-key': 'k'.repeat(201) }),
+      mockRes(),
+      next
+    )
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 400, code: 'IDEMPOTENCY_KEY_TOO_LONG' }))
+    expect(mocks.subscriptionCreate).not.toHaveBeenCalled()
+  })
 })
 
 describe('adminCreatePlan — numeric validation', () => {

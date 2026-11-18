@@ -10,9 +10,10 @@ import { logAction } from '../utils/auditLogger.js'
 import Assignment from '../models/Assignment.js'
 import Alert from '../models/Alert.js'
 import { escapeRegex } from '../utils/escapeRegex.js'
+import { foldedSearchRegex } from '../utils/foldDiacritics.js'
 import mongoose from 'mongoose'
 import { assertClassCapacity } from '../services/classQuota.service.js'
-import { assertStudentCapacity } from '../services/studentQuota.service.js'
+import { assertStudentCapacity, getTeacherStudentQuota } from '../services/studentQuota.service.js'
 import { withTeacherQuotaLock } from '../services/teacherQuotaLock.service.js'
 
 const ensureClassCanBeDeleted = async (classId) => {
@@ -384,8 +385,9 @@ export const getAdminClasses = asyncHandler(async (req, res) => {
 })
 
 export const getAdminClassOptions = asyncHandler(async (req, res) => {
+  const nameRegex = foldedSearchRegex(req.query.search)
   const filter = { status: 'active' }
-  if (req.query.search) filter.name = { $regex: escapeRegex(String(req.query.search)), $options: 'i' }
+  if (nameRegex) filter.name = nameRegex
   const classes = await Class.find(filter).select('name').sort({ name: 1 }).limit(30).lean()
   res.status(200).json({ success: true, data: classes })
 })
@@ -455,8 +457,24 @@ export const updateClassByAdmin = asyncHandler(async (req, res) => {
       const teacher = await User.findOne({ _id: teacherId, role: 'teacher', accountStatus: 'active' })
       if (!teacher) throw new ErrorResponse('Active teacher not found', 400)
       if (cls.status === 'active' && String(cls.teacher) !== String(teacher._id)) {
-        await assertClassCapacity(teacher._id)
-        await assertStudentCapacity({ teacher: teacher._id, status: 'active' }, cls.students)
+        // The admin is moving a class onto someone else. Quota errors here say
+        // "you have 0 slots" as if the admin owned them, so name the teacher and
+        // the real cause instead; the page turns the code into a dialog.
+        const { subscription } = await getTeacherStudentQuota(teacher._id)
+        if (!subscription) {
+          throw new ErrorResponse(
+            `Giáo viên "${teacher.name}" chưa có gói đang hoạt động nên không nhận được lớp.`,
+            403,
+            'TEACHER_HAS_NO_PLAN',
+          )
+        }
+        try {
+          await assertClassCapacity(teacher._id)
+          await assertStudentCapacity({ teacher: teacher._id, status: 'active' }, cls.students)
+        } catch (quotaError) {
+          if (quotaError.statusCode !== 403) throw quotaError
+          throw new ErrorResponse(`Không thể gán lớp cho "${teacher.name}": ${quotaError.message}`, 403, 'TEACHER_QUOTA_EXCEEDED')
+        }
       }
       cls.teacher = teacher._id
     }
@@ -476,6 +494,9 @@ export const updateClassByAdmin = asyncHandler(async (req, res) => {
  * @access  Private (admin)
  */
 export const forceUnenrollStudent = asyncHandler(async (req, res) => {
+  const studentId = typeof req.body?.studentId === 'string' ? req.body.studentId.trim() : ''
+  if (!studentId) throw new ErrorResponse('Please provide studentId', 400)
+
   let cls = await Class.findById(req.params.id)
   if (!cls) throw new ErrorResponse('Class not found', 404)
   const ownerId = String(cls.teacher)
@@ -484,12 +505,19 @@ export const forceUnenrollStudent = asyncHandler(async (req, res) => {
     cls = await Class.findById(req.params.id)
     if (!cls) throw new ErrorResponse('Class not found', 404)
     if (String(cls.teacher) !== ownerId) throw new ErrorResponse('Class ownership changed; reload and retry.', 409, 'CLASS_OWNER_CHANGED')
-    cls.students = cls.students.filter(s => s.toString() !== req.body.studentId)
+    const isMember = id => String(id) === studentId
+    const enrolled = (cls.students || []).some(isMember)
+    const pending = (cls.pendingStudents || []).some(isMember)
+    // Reporting success (and auditing a removal) for a student who was never
+    // here hides a stale roster or a wrong pick from the admin.
+    if (!enrolled && !pending) throw new ErrorResponse('Student is not in this class', 404)
+    cls.students = (cls.students || []).filter(id => !isMember(id))
+    cls.pendingStudents = (cls.pendingStudents || []).filter(id => !isMember(id))
     await cls.save()
   })
 
   await logAction(req.user._id, 'FORCE_UNENROLL_STUDENT', 'Class', cls._id, {
-    studentId: req.body.studentId,
+    studentId,
     className: cls.name,
   })
 
@@ -535,8 +563,11 @@ export const transferStudent = asyncHandler(async (req, res) => {
       throw new ErrorResponse('Student is not in the source class', 400)
     }
 
-    await assertStudentCapacity(toClass, [studentId])
     const wasInTarget = toClass.students.some(id => id.toString() === studentId.toString())
+    // Moving into a class the student already attends would only drop them
+    // from the source while the admin is told they were transferred.
+    if (wasInTarget) throw new ErrorResponse('Student is already in the target class', 409, 'STUDENT_ALREADY_IN_CLASS')
+    await assertStudentCapacity(toClass, [studentId])
     const move = async session => {
       const add = () => session
         ? Class.updateOne({ _id: toClassId }, { $addToSet: { students: studentId }, $pull: { pendingStudents: studentId } }, { session })
@@ -549,7 +580,10 @@ export const transferStudent = asyncHandler(async (req, res) => {
           if (session) await Class.updateOne(filter, update, { session })
           else await Class.updateOne(filter, update)
         } else {
-          const filter = { students: studentId, _id: { $ne: toClassId } }
+          // Without a source the admin only saw the student's active classes
+          // (getAdminStudentClasses), so only those may be vacated. Archived
+          // rosters are history and must keep the student.
+          const filter = { students: studentId, _id: { $ne: toClassId }, status: 'active' }
           const update = { $pull: { students: studentId } }
           if (session) await Class.updateMany(filter, update, { session })
           else await Class.updateMany(filter, update)
@@ -573,7 +607,9 @@ export const transferStudent = asyncHandler(async (req, res) => {
         await session.withTransaction(() => move(session))
         movedTransactionally = true
       } catch (error) {
-        const unsupported = error.code === 20 || /Transaction numbers are only allowed|Transaction is not supported/.test(error.message || '')
+        // A standalone mongod reports this at session start, before any
+        // transaction runs, so the message match is the only signal.
+        const unsupported = error.code === 20 || /Transaction numbers are only allowed|Transaction is not supported|does not support retryable writes/.test(error.message || '')
         if (!unsupported) throw error
       } finally {
         await session.endSession()
@@ -712,12 +748,17 @@ export const getAdminUsers = asyncHandler(async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1)
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 100))
   const filter = { role, accountStatus: 'active' }
-  if (req.query.search) {
-    const pattern = escapeRegex(String(req.query.search))
-    filter.$or = [{ name: { $regex: pattern, $options: 'i' } }, { email: { $regex: pattern, $options: 'i' } }]
-  }
-  const users = await User.find(filter).select('name email englishLevel').sort({ name: 1 }).skip((page - 1) * limit).limit(limit)
-  const total = await User.countDocuments(filter)
+
+  // Accent-insensitive search: "pham"/"pha" must find "Phạm". The folded regex
+  // expands each letter to its accented variants, so MongoDB filters and pages
+  // instead of this handler loading every user of the role.
+  const searchRegex = foldedSearchRegex(req.query.search)
+  if (searchRegex) filter.$or = [{ name: searchRegex }, { email: searchRegex }]
+  const [users, total] = await Promise.all([
+    User.find(filter).select('name email englishLevel').sort({ name: 1 })
+      .skip((page - 1) * limit).limit(limit).lean(),
+    User.countDocuments(filter),
+  ])
   res.status(200).json({ success: true, count: users.length, total, page, pages: Math.ceil(total / limit) || 1, data: users })
 })
 

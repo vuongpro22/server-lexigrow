@@ -10,6 +10,10 @@ vi.mock('../src/config/db.js', () => ({
   default: vi.fn().mockResolvedValue(),
 }))
 
+vi.mock('../src/services/tier.service.js', () => ({
+  getUserEffectiveTier: vi.fn().mockResolvedValue({ tier: 'free', source: 'free' }),
+}))
+
 vi.mock('../src/models/User.js', () => {
   return {
     default: {

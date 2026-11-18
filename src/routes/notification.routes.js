@@ -7,14 +7,17 @@ import {
   respondParentRequest,
   getPublishedAnnouncements,
 } from '../controllers/notification.controller.js'
-import { protect } from '../middleware/auth.middleware.js'
+import { protect, optionalAuth } from '../middleware/auth.middleware.js'
 
 const router = Router()
 
-// Tất cả route đều yêu cầu đăng nhập (student, parent, teacher đều dùng được)
+// Announcements must reach visitors who have not signed up yet, so this one
+// route resolves the token when present and falls back to the guest audience.
+router.get('/announcements', optionalAuth, getPublishedAnnouncements)
+
+// Every other route requires a signed-in student, parent or teacher.
 router.use(protect)
 
-router.get('/announcements', getPublishedAnnouncements)
 router.get('/', getNotifications)
 router.get('/unread-count', getUnreadCount)
 router.patch('/read-all', markAllNotificationsRead)

@@ -53,6 +53,12 @@ const announcementSchema = new mongoose.Schema(
   { timestamps: true }
 )
 
+announcementSchema.path('expiresAt').validate(function validateExpiryAfterPublish(val) {
+  if (!val || !this.publishAt) return true
+  return val > this.publishAt
+}, 'expiresAt must be after publishAt')
+
 announcementSchema.index({ status: 1, publishAt: -1 })
+announcementSchema.index({ status: 1, expiresAt: 1 })
 
 export default mongoose.model('Announcement', announcementSchema)

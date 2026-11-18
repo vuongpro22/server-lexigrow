@@ -9,6 +9,7 @@ import {
 } from '../controllers/class.controller.js'
 import { getClassAnalytics, getClassInsights, getClassLeaderboard } from '../controllers/teacher.controller.js'
 import { protect, authorize } from '../middleware/auth.middleware.js'
+import { adminLimiter } from '../middleware/rateLimit.middleware.js'
 
 const router = Router()
 
@@ -24,7 +25,9 @@ router.route('/')
   .post(authorize('teacher'), createClass)
   .get(authorize('teacher', 'student'), getClasses)
 
-// Admin-specific class route (placed before /:id)
+// Admin-specific class routes (placed before /:id). Every /admin path is
+// admin-only, so the role check and the shared admin rate limit run once here.
+router.use('/admin', authorize('admin'), adminLimiter)
 router.route('/admin')
   .get(authorize('admin'), getAdminClasses)
 

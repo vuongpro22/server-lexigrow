@@ -1,4 +1,8 @@
 import 'dotenv/config'
+import { webcrypto } from 'node:crypto'
+if (!globalThis.crypto) {
+  globalThis.crypto = webcrypto
+}
 import app from './app.js'
 import connectDB from './config/db.js'
 import { initSocket } from './services/socket.service.js'

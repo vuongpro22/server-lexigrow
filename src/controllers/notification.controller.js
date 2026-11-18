@@ -8,16 +8,44 @@ import User from '../models/User.js'
 import sendEmail from '../utils/sendEmail.js'
 import Announcement from '../models/Announcement.js'
 
+/**
+ * @desc    Announcements live right now, for the popup every visitor sees
+ * @route   GET /api/notifications/announcements
+ * @access  Public — guests see the "all" audience only
+ */
 export const getPublishedAnnouncements = asyncHandler(async (req, res) => {
   const now = new Date()
-  const items = await Announcement.find({
-    status: 'published',
-    audience: { $in: ['all', req.user.role] },
-    $and: [
-      { $or: [{ publishAt: null }, { publishAt: { $lte: now } }] },
-      { $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] },
-    ],
-  }).sort({ createdAt: -1 }).limit(10).select('title body priority createdAt')
+  // A guest has no role, so their audience is just "all".
+  const audiences = req.user?.role ? ['all', req.user.role] : ['all']
+  const items = await Announcement.aggregate([
+    {
+      $match: {
+        status: 'published',
+        audience: { $in: audiences },
+        $and: [
+          { $or: [{ publishAt: null }, { publishAt: { $lte: now } }] },
+          { $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] },
+        ],
+      },
+    },
+    {
+      $addFields: {
+        priorityRank: {
+          $switch: {
+            branches: [
+              { case: { $eq: ['$priority', 'critical'] }, then: 0 },
+              { case: { $eq: ['$priority', 'important'] }, then: 1 },
+            ],
+            default: 2,
+          },
+        },
+      },
+    },
+    { $sort: { priorityRank: 1, createdAt: -1 } },
+    { $limit: 10 },
+    { $project: { title: 1, body: 1, priority: 1, createdAt: 1 } },
+  ])
+
   res.status(200).json({ success: true, data: items })
 })
 

@@ -1,6 +1,7 @@
 import Announcement from '../models/Announcement.js'
 import AuditLog from '../models/AuditLog.js'
 import asyncHandler from '../utils/asyncHandler.js'
+import { escapeRegex } from '../utils/escapeRegex.js'
 
 const AUDIENCES = ['all', 'student', 'teacher', 'parent']
 const PRIORITIES = ['normal', 'important', 'critical']
@@ -97,7 +98,7 @@ export const listAnnouncements = asyncHandler(async (req, res) => {
   const andClauses = filter.status === 'published' ? activeWindowClauses(new Date()) : []
   if (req.query.audience && AUDIENCES.includes(req.query.audience)) filter.audience = req.query.audience
   if (req.query.search) {
-    const escaped = String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const escaped = escapeRegex(String(req.query.search))
     filter.$or = [
       { title: { $regex: escaped, $options: 'i' } },
       { body: { $regex: escaped, $options: 'i' } },

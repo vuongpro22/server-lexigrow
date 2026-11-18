@@ -146,9 +146,9 @@ export const getChatRooms = asyncHandler(async (req, res) => {
   // ponytail: cap only trims the response, add a rooms collection if chat volume grows
   const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200))
 
-  // Aggregate distinct rooms with unread count
+  // Aggregate room rows once; keep the sidebar capped but calculate global stats before that cap.
   const adminIds = await User.find({ role: 'admin' }).distinct('_id')
-  const rooms = await ChatMessage.aggregate([
+  const [result = { rooms: [], stats: [] }] = await ChatMessage.aggregate([
     {
       $group: {
         _id: '$room',
@@ -159,9 +159,28 @@ export const getChatRooms = asyncHandler(async (req, res) => {
         totalMessages: { $sum: 1 },
       },
     },
-    { $sort: { lastMessageAt: -1 } },
-    { $limit: limit },
+    {
+      $facet: {
+        rooms: [
+          { $sort: { lastMessageAt: -1 } },
+          { $limit: limit },
+        ],
+        stats: [
+          {
+            $group: {
+              _id: null,
+              totalRooms: { $sum: 1 },
+              privateRooms: { $sum: { $cond: [{ $ne: ['$_id', 'support'] }, 1, 0] } },
+              unreadMessages: { $sum: '$unreadCount' },
+            },
+          },
+          { $project: { _id: 0, totalRooms: 1, privateRooms: 1, unreadMessages: 1 } },
+        ],
+      },
+    },
   ])
+  const rooms = result.rooms
+  const roomStats = result.stats[0] || { totalRooms: 0, privateRooms: 0, unreadMessages: 0 }
 
   // One query for every room owner instead of a findById per room.
   const ownerIds = rooms
@@ -194,6 +213,7 @@ export const getChatRooms = asyncHandler(async (req, res) => {
   res.status(200).json({
     success: true,
     data: enrichedRooms,
+    stats: roomStats,
   })
 })
 

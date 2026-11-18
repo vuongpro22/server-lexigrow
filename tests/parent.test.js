@@ -48,6 +48,12 @@ vi.mock('../src/models/ParentStudentLink.js', () => ({
 vi.mock('../src/models/Vocabulary.js', () => ({
   default: {
     countDocuments: vi.fn(),
+    find: vi.fn(),
+  }
+}))
+vi.mock('../src/models/WordUsageEvidence.js', () => ({
+  default: {
+    distinct: vi.fn(),
   }
 }))
 vi.mock('../src/models/Essay.js', () => ({
@@ -98,6 +104,7 @@ import request from 'supertest'
 import app from '../src/index.js'
 import User from '../src/models/User.js'
 import Vocabulary from '../src/models/Vocabulary.js'
+import WordUsageEvidence from '../src/models/WordUsageEvidence.js'
 import Essay from '../src/models/Essay.js'
 import AIAnalysis from '../src/models/AIAnalysis.js'
 import Alert from '../src/models/Alert.js'
@@ -111,6 +118,10 @@ describe('Parent API', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     getMasteredWords.mockResolvedValue(new Set())
+    Vocabulary.find.mockReset()
+    Vocabulary.find.mockImplementation(() => mockQuery([]))
+    WordUsageEvidence.distinct.mockReset()
+    WordUsageEvidence.distinct.mockResolvedValue([])
   })
 
   it('should generate a one-time child link code without storing the raw code', async () => {
@@ -420,7 +431,9 @@ describe('Parent API', () => {
     Vocabulary.countDocuments
       .mockResolvedValueOnce(6)
       .mockResolvedValueOnce(3)
-      .mockResolvedValueOnce(6)
+    Vocabulary.find.mockReturnValueOnce(
+      mockQuery(Array.from({ length: 6 }, (_, i) => ({ word: `word_${i}`, reviewCount: 1 })))
+    )
     Essay.find
       .mockReturnValueOnce(mockQuery([
         { _id: 'essay_new', title: 'Recent Essay', status: 'reviewed', submittedAt: new Date('2026-07-20') },
@@ -482,7 +495,9 @@ describe('Parent API', () => {
       _id: 'goal_id',
       goals: [{ label: 'New Words', target: 20, current: 0 }],
     }))
-    Vocabulary.countDocuments.mockResolvedValue(8)
+    Vocabulary.find.mockReturnValueOnce(
+      mockQuery(Array.from({ length: 8 }, (_, i) => ({ word: `word_${i}`, reviewCount: 1 })))
+    )
     Essay.find.mockReturnValue(mockQuery([]))
 
     const res = await request(app)
@@ -505,12 +520,11 @@ describe('Parent API', () => {
     User.findById.mockReturnValueOnce(mockQuery(childMock))
 
     Vocabulary.countDocuments.mockResolvedValueOnce(15) // totalVocab
-    Vocabulary.countDocuments.mockResolvedValueOnce(0)
-    Vocabulary.countDocuments.mockResolvedValueOnce(1)
-    Vocabulary.countDocuments.mockResolvedValueOnce(2)
-    Vocabulary.countDocuments.mockResolvedValueOnce(3)
-    Vocabulary.countDocuments.mockResolvedValueOnce(4)
-    Vocabulary.countDocuments.mockResolvedValueOnce(5)
+    for (const count of [0, 1, 2, 3, 4, 5]) {
+      Vocabulary.find.mockReturnValueOnce(
+        mockQuery(Array.from({ length: count }, (_, i) => ({ word: `week_${count}_${i}`, reviewCount: 1 })))
+      )
+    }
     Essay.countDocuments.mockResolvedValueOnce(4)       // totalEssays
     Essay.find.mockReturnValueOnce(mockQuery(['essay1', 'essay2']))
     AIAnalysis.find.mockReturnValueOnce(mockQuery([

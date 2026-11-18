@@ -8,10 +8,14 @@ const mocks = vi.hoisted(() => ({
   classFindById: vi.fn(),
   classUpdateMany: vi.fn(),
   classUpdateOne: vi.fn(),
+  classDistinct: vi.fn(),
   userFindById: vi.fn(),
+  quotaLockCreate: vi.fn(),
+  quotaLockFindOneAndUpdate: vi.fn(),
   planFindById: vi.fn(),
   planDeleteOne: vi.fn(),
   subscriptionCountDocuments: vi.fn(),
+  subscriptionFind: vi.fn(),
   transactionCountDocuments: vi.fn(),
   auditCreate: vi.fn(),
   auditLogCreate: vi.fn(),
@@ -20,11 +24,19 @@ const mocks = vi.hoisted(() => ({
   userFind: vi.fn(),
 }))
 
+vi.mock('../src/models/TeacherQuotaLock.js', () => ({
+  default: {
+    create: (...args) => mocks.quotaLockCreate(...args),
+    findOneAndUpdate: (...args) => mocks.quotaLockFindOneAndUpdate(...args),
+  },
+}))
+
 vi.mock('../src/models/Class.js', () => ({
   default: {
     findById: (...a) => mocks.classFindById(...a),
     updateMany: (...a) => mocks.classUpdateMany(...a),
     updateOne: (...a) => mocks.classUpdateOne(...a),
+    distinct: (...a) => mocks.classDistinct(...a),
   },
 }))
 
@@ -53,7 +65,8 @@ vi.mock('../src/models/SubscriptionPlan.js', () => ({
 vi.mock('../src/models/Subscription.js', () => ({
   default: {
     countDocuments: (...a) => mocks.subscriptionCountDocuments(...a),
-    find: vi.fn(),
+    find: (...a) => mocks.subscriptionFind(...a),
+    findOne: vi.fn().mockResolvedValue(null),
   },
 }))
 
@@ -104,12 +117,19 @@ vi.mock('../src/middleware/auth.middleware.js', () => ({
 }))
 
 import request from 'supertest'
+import mongoose from 'mongoose'
 import app from '../src/index.js'
 
 beforeEach(() => {
   vi.clearAllMocks()
   mocks.auditLogCreate.mockResolvedValue({ _id: 'audit_1' })
   mocks.classUpdateMany.mockResolvedValue({ modifiedCount: 0 })
+  mocks.classDistinct.mockResolvedValue([])
+  mocks.subscriptionFind.mockReturnValue({ sort: vi.fn().mockResolvedValue([{ maxSponsoredStudents: 10 }]) })
+  mocks.quotaLockCreate.mockImplementation(async () => {
+    throw Object.assign(new Error('Duplicate key'), { code: 11000 })
+  })
+  mocks.quotaLockFindOneAndUpdate.mockResolvedValue({ _id: 'teacher_1' })
 })
 
 describe('POST /api/classes/admin/transfer', () => {
@@ -189,10 +209,41 @@ describe('POST /api/classes/admin/transfer', () => {
     )
   })
 
-  it('keeps the student in the target class when no source class is given', async () => {
-    // A student already enrolled in the target: pulling from every class would
-    // empty it, and the in-memory copy read before the update is stale.
-    const toClass = { _id: 'class_new', name: 'New', students: ['student_1'], save: vi.fn().mockResolvedValue(true) }
+  it('falls back to standalone writes when transaction startup rejects retryable writes', async () => {
+    const previousReadyState = mongoose.connection.readyState
+    const startSession = vi.spyOn(mongoose, 'startSession').mockResolvedValue({
+      withTransaction: vi.fn().mockRejectedValue(new Error('This MongoDB deployment does not support retryable writes. Please add retryWrites=false to your connection string.')),
+      endSession: vi.fn().mockResolvedValue(undefined),
+    })
+    mongoose.connection.readyState = 1
+    const fromClass = { _id: 'class_old', teacher: 'teacher_1', students: ['student_1'] }
+    const toClass = { _id: 'class_new', teacher: 'teacher_1', students: [], status: 'active' }
+    mocks.userFindById.mockResolvedValue({ _id: 'student_1', email: 's@x.com', role: 'student', accountStatus: 'active' })
+    mocks.classFindById.mockImplementation((id) => Promise.resolve(id === 'class_old' ? fromClass : toClass))
+
+    try {
+      await request(app)
+        .post('/api/classes/admin/transfer')
+        .send({ studentId: 'student_1', fromClassId: 'class_old', toClassId: 'class_new' })
+        .expect(200)
+
+      expect(startSession).toHaveBeenCalledOnce()
+      expect(mocks.classUpdateOne).toHaveBeenCalledWith(
+        { _id: 'class_new' },
+        { $addToSet: { students: 'student_1' }, $pull: { pendingStudents: 'student_1' } },
+      )
+      expect(mocks.classUpdateOne).toHaveBeenCalledWith(
+        { _id: 'class_old' },
+        { $pull: { students: 'student_1' } },
+      )
+    } finally {
+      startSession.mockRestore()
+      mongoose.connection.readyState = previousReadyState
+    }
+  })
+
+  it('only vacates active classes when no source class is given', async () => {
+    const toClass = { _id: 'class_new', name: 'New', students: [], save: vi.fn().mockResolvedValue(true) }
 
     mocks.userFindById.mockResolvedValue({ _id: 'student_1', email: 's@x.com', role: 'student', accountStatus: 'active' })
     mocks.classFindById.mockResolvedValue(toClass)
@@ -205,17 +256,80 @@ describe('POST /api/classes/admin/transfer', () => {
 
     // The target must be excluded from the pull, otherwise its roster is emptied.
     const pullFilter = mocks.classUpdateMany.mock.calls[0][0]
+    // Archived classes keep their historical roster.
     expect(pullFilter).toEqual({
       students: 'student_1',
       _id: { $ne: 'class_new' },
+      status: 'active',
     })
 
-    // Membership is (re)asserted atomically regardless of the stale snapshot.
+    // Membership is asserted atomically rather than through the stale snapshot.
     expect(mocks.classUpdateOne).toHaveBeenCalledWith(
       { _id: 'class_new' },
       { $addToSet: { students: 'student_1' }, $pull: { pendingStudents: 'student_1' } }
     )
     expect(toClass.save).not.toHaveBeenCalled()
+  })
+
+  it('refuses to transfer a student into a class they already attend', async () => {
+    // Accepting it would only drop the student from the source while the UI
+    // reports a transfer.
+    const toClass = { _id: 'class_new', name: 'New', students: ['student_1'], save: vi.fn().mockResolvedValue(true) }
+
+    mocks.userFindById.mockResolvedValue({ _id: 'student_1', email: 's@x.com', role: 'student', accountStatus: 'active' })
+    mocks.classFindById.mockResolvedValue(toClass)
+
+    const res = await request(app)
+      .post('/api/classes/admin/transfer')
+      .send({ studentId: 'student_1', toClassId: 'class_new' })
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('Student is already in the target class')
+    expect(res.body.code).toBe('STUDENT_ALREADY_IN_CLASS')
+    expect(mocks.classUpdateOne).not.toHaveBeenCalled()
+    expect(mocks.classUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.auditCreate).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /api/classes/admin/:id/unenroll', () => {
+  function makeRoster(fields = {}) {
+    return { _id: 'class_1', name: 'Roster', teacher: 'teacher_1', students: ['student_1'], pendingStudents: ['student_2'], save: vi.fn().mockResolvedValue(true), ...fields }
+  }
+
+  it('rejects a request without a studentId', async () => {
+    mocks.classFindById.mockResolvedValue(makeRoster())
+    const res = await request(app).post('/api/classes/admin/class_1/unenroll').send({})
+    expect(res.status).toBe(400)
+    expect(mocks.auditLogCreate).not.toHaveBeenCalled()
+  })
+
+  it('refuses to report a removal for a student who is not in the class', async () => {
+    const cls = makeRoster()
+    mocks.classFindById.mockResolvedValue(cls)
+    const res = await request(app).post('/api/classes/admin/class_1/unenroll').send({ studentId: 'student_9' })
+    expect(res.status).toBe(404)
+    expect(cls.save).not.toHaveBeenCalled()
+    expect(mocks.auditLogCreate).not.toHaveBeenCalled()
+  })
+
+  it('removes an enrolled student and audits it', async () => {
+    const cls = makeRoster()
+    mocks.classFindById.mockResolvedValue(cls)
+    const res = await request(app).post('/api/classes/admin/class_1/unenroll').send({ studentId: 'student_1' })
+    expect(res.status).toBe(200)
+    expect(cls.students).toEqual([])
+    expect(cls.pendingStudents).toEqual(['student_2'])
+    expect(mocks.auditLogCreate).toHaveBeenCalledWith(expect.objectContaining({ action: 'FORCE_UNENROLL_STUDENT' }))
+  })
+
+  it('also clears a pending join request', async () => {
+    const cls = makeRoster()
+    mocks.classFindById.mockResolvedValue(cls)
+    const res = await request(app).post('/api/classes/admin/class_1/unenroll').send({ studentId: 'student_2' })
+    expect(res.status).toBe(200)
+    expect(cls.pendingStudents).toEqual([])
+    expect(cls.students).toEqual(['student_1'])
   })
 })
 
@@ -243,7 +357,7 @@ describe('DELETE /api/admin/pricing/plans/:id', () => {
     expect(mocks.planDeleteOne).not.toHaveBeenCalled()
   })
 
-  it('deletes an unreferenced plan', async () => {
+  it('deletes an unreferenced plan and checks both plan ObjectId and planSlug', async () => {
     mocks.planFindById.mockResolvedValue({ _id: 'plan_1', name: 'Pro', slug: 'pro' })
     mocks.subscriptionCountDocuments.mockResolvedValue(0)
     mocks.transactionCountDocuments.mockResolvedValue(0)
@@ -252,6 +366,12 @@ describe('DELETE /api/admin/pricing/plans/:id', () => {
     const res = await request(app).delete('/api/admin/pricing/plans/plan_1')
 
     expect(res.status).toBe(200)
+    expect(mocks.subscriptionCountDocuments).toHaveBeenCalledWith({
+      $or: [{ plan: 'plan_1' }, { planSlug: 'pro' }],
+    })
+    expect(mocks.transactionCountDocuments).toHaveBeenCalledWith({
+      $or: [{ plan: 'plan_1' }, { planSlug: 'pro' }],
+    })
     expect(mocks.planDeleteOne).toHaveBeenCalled()
   })
 })

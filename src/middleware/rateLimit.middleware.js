@@ -81,7 +81,7 @@ export const authResendLimiter = rateLimit({
   keyGenerator: (req) => {
     const email =
       typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
-    return email || ipKeyGenerator(req.ip)
+    return email || ipKeyGenerator(req.ip || '127.0.0.1')
   },
   message: {
     success: false,
@@ -105,7 +105,7 @@ export const adminLimiter = rateLimit({
   limit: 300,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => String(req.user?._id || ipKeyGenerator(req.ip)),
+  keyGenerator: (req) => String(req.user?._id || ipKeyGenerator(req.ip || '127.0.0.1')),
   message: {
     success: false,
     message: 'Quá nhiều yêu cầu quản trị. Vui lòng thử lại sau ít phút.',
@@ -122,7 +122,7 @@ export const payosWebhookLimiter = rateLimit({
   limit: 100,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => ipKeyGenerator(req.ip),
+  keyGenerator: (req) => ipKeyGenerator(req.ip || '127.0.0.1'),
   message: {
     success: false,
     message: 'Quá nhiều yêu cầu webhook. Vui lòng thử lại sau.',

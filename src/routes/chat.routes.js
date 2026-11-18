@@ -6,6 +6,7 @@ import {
   markRoomRead,
 } from '../controllers/chat.controller.js'
 import { protect, authorize } from '../middleware/auth.middleware.js'
+import { adminLimiter } from '../middleware/rateLimit.middleware.js'
 
 const router = Router()
 
@@ -19,7 +20,7 @@ router.get('/history/:room', getChatHistory)
 router.post('/message', sendMessage)
 
 // Admin only: get list of all chat rooms with unread counts
-router.get('/rooms', authorize('admin'), getChatRooms)
+router.get('/rooms', authorize('admin'), adminLimiter, getChatRooms)
 
 // Mark all messages in a room as read
 router.post('/rooms/:room/read', markRoomRead)

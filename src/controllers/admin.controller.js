@@ -10,7 +10,12 @@ import ErrorResponse from '../utils/ErrorResponse.js'
 import { escapeRegex } from '../utils/escapeRegex.js'
 import { encryptSecret } from '../utils/secretCrypto.js'
 import { estimateCost } from '../services/aiGateway.service.js'
+import { forceReleaseAdminMutationLock } from '../services/adminMutationLock.service.js'
+import { logAction } from '../utils/auditLogger.js'
+import { randomBytes } from 'node:crypto'
 import mongoose from 'mongoose'
+
+const REMOVED_CONFIG_KEYS = new Set(['HF_API_TOKEN'])
 
 const parseDateFilter = (value) => {
   const parsed = new Date(value)
@@ -18,23 +23,14 @@ const parseDateFilter = (value) => {
   return parsed
 }
 
-/**
- * @desc    Get paginated audit logs with filters
- * @route   GET /api/admin/logs
- * @access  Private (Admin)
- */
-export const getAuditLogs = asyncHandler(async (req, res) => {
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10))
-  const skip = (page - 1) * limit
-
-  const { action, role, startDate, endDate, search } = req.query
+async function buildAuditQuery({ action, role, startDate, endDate, search }) {
   const query = {}
+  const clauses = []
 
   // 1. Filter by role
   if (role) {
     const usersWithRole = await User.find({ role }).select('_id')
-    query.$or = [{ user: { $in: usersWithRole.map(u => u._id) } }, { actorRole: role }]
+    clauses.push({ $or: [{ user: { $in: usersWithRole.map(u => u._id) } }, { actorRole: role }] })
   }
 
   // 2. Filter by search (user name or email)
@@ -63,9 +59,13 @@ export const getAuditLogs = asyncHandler(async (req, res) => {
       { actorName: { $regex: pattern, $options: 'i' } },
       { actorEmail: { $regex: pattern, $options: 'i' } },
     ]
-    if (query.$or) query.$and = [{ $or: query.$or }, { $or: actorSearch }]
-    else query.$or = actorSearch
-    if (query.$and) delete query.$or
+    clauses.push({ $or: actorSearch })
+  }
+
+  if (clauses.length === 1) {
+    query.$or = clauses[0].$or
+  } else if (clauses.length > 1) {
+    query.$and = clauses
   }
 
   // 3. Filter by action
@@ -79,6 +79,21 @@ export const getAuditLogs = asyncHandler(async (req, res) => {
     if (startDate) query.createdAt.$gte = parseDateFilter(startDate)
     if (endDate) query.createdAt.$lte = parseDateFilter(endDate)
   }
+
+  return query
+}
+
+/**
+ * @desc    Get paginated audit logs with filters
+ * @route   GET /api/admin/logs
+ * @access  Private (Admin)
+ */
+export const getAuditLogs = asyncHandler(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10))
+  const skip = (page - 1) * limit
+
+  const query = await buildAuditQuery(req.query)
 
   const total = await AuditLog.countDocuments(query)
   const logs = await AuditLog.find(query)
@@ -241,7 +256,7 @@ export const seedMockData = asyncHandler(async (req, res) => {
     teacher = await User.create({
       name: 'Nguyễn Văn Dạy',
       email: 'teacher.mock@lexigrow.edu.vn',
-      password: 'password123',
+      password: randomBytes(24).toString('hex'),
       role: 'teacher',
       institution: 'Hanoi University'
     })
@@ -253,7 +268,7 @@ export const seedMockData = asyncHandler(async (req, res) => {
     student = await User.create({
       name: 'Trần Văn Học',
       email: 'student.mock@lexigrow.edu.vn',
-      password: 'password123',
+      password: randomBytes(24).toString('hex'),
       role: 'student',
       englishLevel: 'B1'
     })
@@ -336,8 +351,8 @@ export const seedMockData = asyncHandler(async (req, res) => {
       { action: 'CREATE_PROMPT', targetType: 'SystemPrompt', details: { name: 'IELTS Band Scoring System' } },
       { action: 'UPDATE_PROMPT', targetType: 'SystemPrompt', details: { name: 'IELTS Band Scoring System', field: 'template' } },
       { action: 'RESOLVE_ALERT', targetType: 'Alert', details: { alertType: 'Stagnating Vocabulary', studentName: 'Trần Văn Học' } },
-      { action: 'LOCK_USER', targetType: 'User', details: { targetUserEmail: 'spammer@lexigrow.com', reason: 'Spam comments' } },
-      { action: 'APPROVE_USER', targetType: 'User', details: { targetUserEmail: 'teacher.new@lexigrow.edu.vn', role: 'teacher' } }
+      { action: 'ADMIN_UPDATE_USER_STATUS', targetType: 'User', details: { targetUserEmail: 'spammer@lexigrow.com', reason: 'Spam comments' } },
+      { action: 'ADMIN_APPROVE_USER', targetType: 'User', details: { targetUserEmail: 'teacher.new@lexigrow.edu.vn', role: 'teacher' } }
     ]
 
     const baseDate = new Date()
@@ -450,11 +465,11 @@ const isMaskedSecret = (val) => {
  * @access  Private (Admin)
  */
 export const getConfigs = asyncHandler(async (req, res) => {
-  const configs = (await Config.find({})).filter(c => c.key !== 'HF_API_TOKEN')
+  const configs = (await Config.find({})).filter(c => !REMOVED_CONFIG_KEYS.has(c.key))
   
   // Mask API Keys and sensitive settings for security
   const maskedConfigs = configs.map(c => {
-    const isSensitive = isSensitiveConfigKey(c.key)
+    const isSensitive = Boolean(c.sensitive) || isSensitiveConfigKey(c.key)
     return {
       key: c.key,
       value: isSensitive && c.value ? maskSecretValue(c.value) : c.value,
@@ -488,45 +503,53 @@ export const updateConfigs = asyncHandler(async (req, res) => {
   const updatedSettings = []
   const logDetails = {}
   const changes = []
+  const unknownKeys = []
   const seen = new Set()
 
   for (const item of settings) {
     const key = item?.key
     if (!key || seen.has(key)) throw new ErrorResponse('Each setting key must be unique', 400)
     seen.add(key)
-    if (key === 'HF_API_TOKEN') {
+    if (REMOVED_CONFIG_KEYS.has(key)) {
       throw new ErrorResponse('Hugging Face AI detection has been removed', 410)
     }
     // Normalize whitespace around secrets before validating/storing.
     const value = typeof item.value === 'string' ? item.value.trim() : item.value
 
     const config = await Config.findOne({ key })
-    if (config) {
-      const isSensitive = isSensitiveConfigKey(key)
-      if (isSensitive && isMaskedSecret(value)) {
-        continue
-      }
-
-      // Validate provider-specific format; empty values clear the key.
-      const expected = TOKEN_FORMATS[key]
-      if (expected && value && !expected.test(value)) {
-        throw new ErrorResponse(`Value for ${key} does not match the expected format`, 400)
-      }
-
-      const oldValue = config.value
-      const storedValue = isSensitive && value ? encryptSecret(String(value)) : value
-      config.value = storedValue
-      const validation = config.validateSync?.()
-      if (validation) throw validation
-      changes.push({ config, oldValue, storedValue })
-
-      updatedSettings.push({
-        key,
-        value: isSensitive && value ? maskSecretValue(value) : value,
-        isSecret: isSensitive,
-      })
-      logDetails[key] = { from: oldValue ? 'configured' : 'empty', to: value ? 'updated' : 'empty' }
+    if (!config) {
+      unknownKeys.push(key)
+      continue
     }
+
+    const isSensitive = Boolean(config.sensitive) || isSensitiveConfigKey(key)
+    if (isSensitive && isMaskedSecret(value)) {
+      continue
+    }
+
+    // Validate provider-specific format; empty values clear the key.
+    const expected = TOKEN_FORMATS[key]
+    if (expected && value && !expected.test(value)) {
+      throw new ErrorResponse(`Value for ${key} does not match the expected format`, 400)
+    }
+
+    const oldValue = config.value
+    const storedValue = isSensitive && value ? encryptSecret(String(value)) : value
+    config.value = storedValue
+    const validation = config.validateSync?.()
+    if (validation) throw validation
+    changes.push({ config, oldValue, storedValue })
+
+    updatedSettings.push({
+      key,
+      value: isSensitive && value ? maskSecretValue(value) : value,
+      isSecret: isSensitive,
+    })
+    logDetails[key] = { from: oldValue ? 'configured' : 'empty', to: value ? 'updated' : 'empty' }
+  }
+
+  if (unknownKeys.length > 0) {
+    throw new ErrorResponse(`Unknown config keys: ${unknownKeys.join(', ')}`, 422)
   }
 
   const saveChanges = async (session) => {
@@ -553,10 +576,25 @@ export const updateConfigs = asyncHandler(async (req, res) => {
     try {
       await saveChanges(null)
     } catch (error) {
-      await Promise.allSettled(changes.map(async ({ config, oldValue }) => {
+      const rollbackResults = await Promise.allSettled(changes.map(async ({ config, oldValue }) => {
         config.value = oldValue
         await config.save()
       }))
+      const failedRollbacks = rollbackResults
+        .map((r, idx) => (r.status === 'rejected' ? changes[idx]?.config?.key : null))
+        .filter(Boolean)
+      if (failedRollbacks.length > 0) {
+        console.error('[ADMIN] Config rollback failed for keys:', failedRollbacks.join(', '))
+        await AuditLog.create({
+          user: req.user._id,
+          actorName: req.user.name || '',
+          actorEmail: req.user.email || '',
+          actorRole: req.user.role || '',
+          action: 'UPDATE_SYSTEM_CONFIG',
+          targetType: 'SystemConfig',
+          details: { rollbackFailedKeys: failedRollbacks, error: error.message || 'Save failed' },
+        }).catch(() => {})
+      }
       throw error
     }
   }
@@ -695,5 +733,23 @@ export const getAIMonitoringAnalytics = asyncHandler(async (req, res) => {
       },
       dailyStats
     }
+  })
+})
+
+/**
+ * @desc    Force-release a stale admin user mutation lock after process crash
+ * @route   DELETE /api/admin/mutation-lock
+ * @access  Private (Admin)
+ */
+export const forceReleaseMutationLock = asyncHandler(async (req, res) => {
+  const result = await forceReleaseAdminMutationLock()
+  await logAction(req.user._id, 'ADMIN_FORCE_RELEASE_MUTATION_LOCK', 'SystemConfig', 'admin-user-mutations', {
+    released: result.released,
+    previousOwner: result.previousOwner,
+  })
+  res.status(200).json({
+    success: true,
+    released: result.released,
+    previousOwner: result.previousOwner,
   })
 })

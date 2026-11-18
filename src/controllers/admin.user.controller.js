@@ -89,17 +89,36 @@ export const getUsers = asyncHandler(async (req, res) => {
 // PATCH /api/admin/users/:id/status
 // body: { status: 'active'|'suspended'|'rejected', note? }
 // ─────────────────────────────────────────────────────────────
+const VALID_STATUS_TRANSITIONS = {
+  active: ['active', 'suspended'],
+  suspended: ['active', 'suspended'],
+  pending_approval: ['active', 'suspended', 'pending_approval', 'rejected'],
+  rejected: ['active', 'suspended', 'rejected'],
+  deleted: [],
+}
+
 export const updateUserStatus = adminMutationHandler(async (req, res) => {
   const { status, note = '' } = req.body
   const VALID = ['active', 'suspended', 'pending_approval', 'rejected']
   if (!VALID.includes(status)) throw new ErrorResponse('Invalid status value', 400)
+  if (typeof note !== 'string') {
+    throw new ErrorResponse('Status note must be a string', 400)
+  }
+  if (note.length > 500) {
+    throw new ErrorResponse('Status note cannot exceed 500 characters', 400)
+  }
 
   const user = await User.findById(req.params.id)
   if (!user) throw new ErrorResponse('User not found', 404)
   if (user.accountStatus === 'deleted') throw new ErrorResponse('User has been deleted', 404)
   if (user.role === 'admin') throw new ErrorResponse('Cannot change status of an admin account', 403)
 
-  const oldStatus   = user.accountStatus
+  const oldStatus = user.accountStatus || 'active'
+  const allowedNext = VALID_STATUS_TRANSITIONS[oldStatus] || []
+  if (!allowedNext.includes(status)) {
+    throw new ErrorResponse(`Cannot transition from '${oldStatus}' to '${status}'`, 422)
+  }
+
   user.accountStatus = status
   user.statusNote    = note
   await user.save()
@@ -173,9 +192,11 @@ export const updateUserRole = adminMutationHandler(async (req, res) => {
 // POST /api/admin/users/:id/reset-password
 // body: { newPassword }
 // ─────────────────────────────────────────────────────────────
-export const resetUserPassword = asyncHandler(async (req, res) => {
-  const { newPassword } = req.body
-  if (!newPassword || newPassword.length < 6) {
+export const resetUserPassword = adminMutationHandler(async (req, res) => {
+  // Validate and store the same trimmed value; otherwise "  secret  " passes
+  // the length check but is saved with spaces the user will never type.
+  const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword.trim() : ''
+  if (newPassword.length < 6) {
     throw new ErrorResponse('Password must be at least 6 characters', 400)
   }
 
@@ -197,7 +218,7 @@ export const resetUserPassword = asyncHandler(async (req, res) => {
     email: user.email,
   })
 
-  res.status(200).json({ success: true, message: 'Password has been reset successfully' })
+  return () => res.status(200).json({ success: true, message: 'Password has been reset successfully' })
 })
 
 // ─────────────────────────────────────────────────────────────
@@ -217,7 +238,9 @@ export const deleteUser = adminMutationHandler(async (req, res) => {
   // Capture the parents before user.parents is cleared. They are needed to
   // evict live parent sockets from the deleted student's rooms afterwards.
   const linkedParentIds = user.role === 'student'
-    ? [...new Set((user.parents || []).map(parentId => String(parentId?._id || parentId)))]
+    ? [...new Set((user.parents || [])
+        .map(parentRef => String(parentRef?._id ?? parentRef ?? ''))
+        .filter(id => id && id !== 'undefined'))]
     : []
   await AuditLog.updateMany(
     { user: user._id, actorEmail: { $in: ['', null] } },
@@ -363,36 +386,6 @@ export const approveUser = adminMutationHandler(async (req, res) => {
   user.statusNote    = `Approved by ${req.user.name} on ${new Date().toISOString()}`
   await user.save()
 
-  // Send approval email
-  const safeName = escapeHtml(user.name)
-  const safeRole = escapeHtml(user.role)
-  try {
-    await sendEmail({
-      email:   user.email,
-      subject: '[LexiGrow] Tài khoản của bạn đã được phê duyệt!',
-      message: `Xin chào ${user.name}, tài khoản ${user.role} của bạn trên LexiGrow đã được Admin phê duyệt. Bạn có thể đăng nhập ngay bây giờ.`,
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:24px;border:1px solid #e0e7ff;border-radius:12px">
-          <h2 style="color:#005bbf;text-align:center">✅ Tài khoản đã được duyệt!</h2>
-          <p>Xin chào <strong>${safeName}</strong>,</p>
-          <p>Tài khoản <strong>${safeRole}</strong> của bạn trên hệ thống <strong>LexiGrow</strong> đã được Admin phê duyệt thành công.</p>
-          <p>Bạn có thể đăng nhập và bắt đầu sử dụng hệ thống ngay bây giờ.</p>
-          <div style="text-align:center;margin:24px 0">
-            <a href="${process.env.CLIENT_URL || 'http://localhost:5173'}/login" 
-               style="background:#005bbf;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:700">
-              Đăng nhập ngay
-            </a>
-          </div>
-          <hr style="border:0;border-top:1px solid #eee;margin:20px 0"/>
-          <p style="color:#999;font-size:12px;text-align:center">LexiGrow © 2026 - Measured Writing Growth</p>
-        </div>
-      `,
-    })
-  } catch (err) {
-    console.error('[ADMIN] Failed to send approval email:', err.message)
-    // Non-blocking: approval still succeeds
-  }
-
   console.log(`[ADMIN] ${req.user.name} APPROVED ${user.email} (${user.role})`)
 
   await logAction(req.user._id, 'ADMIN_APPROVE_USER', 'User', user._id, {
@@ -400,15 +393,59 @@ export const approveUser = adminMutationHandler(async (req, res) => {
     role: user.role,
   })
 
-  return () => res.status(200).json({ success: true, data: sanitize(user) })
+  // The email runs after the mutation lock is released: a slow SMTP server
+  // must not block every other admin's role/status changes with a 409.
+  return async () => {
+    const safeName = escapeHtml(user.name)
+    const safeRole = escapeHtml(user.role)
+    try {
+      await sendEmail({
+        email:   user.email,
+        subject: '[LexiGrow] Tài khoản của bạn đã được phê duyệt!',
+        message: `Xin chào ${user.name}, tài khoản ${user.role} của bạn trên LexiGrow đã được Admin phê duyệt. Bạn có thể đăng nhập ngay bây giờ.`,
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:24px;border:1px solid #e0e7ff;border-radius:12px">
+            <h2 style="color:#005bbf;text-align:center">✅ Tài khoản đã được duyệt!</h2>
+            <p>Xin chào <strong>${safeName}</strong>,</p>
+            <p>Tài khoản <strong>${safeRole}</strong> của bạn trên hệ thống <strong>LexiGrow</strong> đã được Admin phê duyệt thành công.</p>
+            <p>Bạn có thể đăng nhập và bắt đầu sử dụng hệ thống ngay bây giờ.</p>
+            <div style="text-align:center;margin:24px 0">
+              <a href="${process.env.CLIENT_URL || 'http://localhost:5173'}/login" 
+                 style="background:#005bbf;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:700">
+                Đăng nhập ngay
+              </a>
+            </div>
+            <hr style="border:0;border-top:1px solid #eee;margin:20px 0"/>
+            <p style="color:#999;font-size:12px;text-align:center">LexiGrow © 2026 - Measured Writing Growth</p>
+          </div>
+        `,
+      })
+    } catch (err) {
+      console.error('[ADMIN] Failed to send approval email:', err.message)
+      // Non-blocking: approval still succeeds
+    }
+    res.status(200).json({ success: true, data: sanitize(user) })
+  }
 })
 
 // ─────────────────────────────────────────────────────────────
 // POST /api/admin/approvals/:id/reject
 // body: { reason? }
 // ─────────────────────────────────────────────────────────────
+export const REJECT_REASON_MAX_LENGTH = 500
+const DEFAULT_REJECT_REASON = 'Không đáp ứng yêu cầu của hệ thống.'
+
 export const rejectUser = adminMutationHandler(async (req, res) => {
-  const { reason = 'Không đáp ứng yêu cầu của hệ thống.' } = req.body
+  const rawReason = req.body?.reason
+  if (rawReason !== undefined && rawReason !== null && typeof rawReason !== 'string') {
+    throw new ErrorResponse('Rejection reason must be a string', 400)
+  }
+  // The field is optional in the UI; a blank entry would otherwise email the
+  // applicant an empty "Lý do:" line.
+  const reason = (rawReason || '').trim() || DEFAULT_REJECT_REASON
+  if (reason.length > REJECT_REASON_MAX_LENGTH) {
+    throw new ErrorResponse(`Rejection reason cannot exceed ${REJECT_REASON_MAX_LENGTH} characters`, 400)
+  }
 
   const user = await User.findById(req.params.id)
   if (!user) throw new ErrorResponse('User not found', 404)
@@ -420,33 +457,6 @@ export const rejectUser = adminMutationHandler(async (req, res) => {
   user.statusNote    = `Rejected by ${req.user.name}: ${reason}`
   await user.save()
 
-  // Send rejection email
-  const safeName = escapeHtml(user.name)
-  const safeRole = escapeHtml(user.role)
-  const safeReason = escapeHtml(reason)
-  try {
-    await sendEmail({
-      email:   user.email,
-      subject: '[LexiGrow] Đơn đăng ký tài khoản không được chấp nhận',
-      message: `Xin chào ${user.name}, đơn đăng ký tài khoản của bạn đã bị từ chối. Lý do: ${reason}`,
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:24px;border:1px solid #fde8e8;border-radius:12px">
-          <h2 style="color:#ba1a1a;text-align:center">❌ Đơn đăng ký không được chấp nhận</h2>
-          <p>Xin chào <strong>${safeName}</strong>,</p>
-          <p>Chúng tôi rất tiếc phải thông báo rằng đơn đăng ký tài khoản <strong>${safeRole}</strong> của bạn trên LexiGrow không được chấp nhận.</p>
-          <div style="background:#fff3f3;border-left:4px solid #ba1a1a;padding:12px 16px;border-radius:6px;margin:16px 0">
-            <strong>Lý do:</strong> ${safeReason}
-          </div>
-          <p>Nếu bạn cho rằng có sự nhầm lẫn, vui lòng liên hệ với chúng tôi để được hỗ trợ.</p>
-          <hr style="border:0;border-top:1px solid #eee;margin:20px 0"/>
-          <p style="color:#999;font-size:12px;text-align:center">LexiGrow © 2026 - Measured Writing Growth</p>
-        </div>
-      `,
-    })
-  } catch (err) {
-    console.error('[ADMIN] Failed to send rejection email:', err.message)
-  }
-
   console.log(`[ADMIN] ${req.user.name} REJECTED ${user.email} (${user.role}). Reason: ${reason}`)
 
   await logAction(req.user._id, 'ADMIN_REJECT_USER', 'User', user._id, {
@@ -455,13 +465,45 @@ export const rejectUser = adminMutationHandler(async (req, res) => {
     reason,
   })
 
-  return () => res.status(200).json({ success: true, data: sanitize(user) })
+  // Sent outside the mutation lock, same as the approval email.
+  return async () => {
+    const safeName = escapeHtml(user.name)
+    const safeRole = escapeHtml(user.role)
+    const safeReason = escapeHtml(reason)
+    try {
+      await sendEmail({
+        email:   user.email,
+        subject: '[LexiGrow] Đơn đăng ký tài khoản không được chấp nhận',
+        message: `Xin chào ${user.name}, đơn đăng ký tài khoản của bạn đã bị từ chối. Lý do: ${reason}`,
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:24px;border:1px solid #fde8e8;border-radius:12px">
+            <h2 style="color:#ba1a1a;text-align:center">❌ Đơn đăng ký không được chấp nhận</h2>
+            <p>Xin chào <strong>${safeName}</strong>,</p>
+            <p>Chúng tôi rất tiếc phải thông báo rằng đơn đăng ký tài khoản <strong>${safeRole}</strong> của bạn trên LexiGrow không được chấp nhận.</p>
+            <div style="background:#fff3f3;border-left:4px solid #ba1a1a;padding:12px 16px;border-radius:6px;margin:16px 0">
+              <strong>Lý do:</strong> ${safeReason}
+            </div>
+            <p>Nếu bạn cho rằng có sự nhầm lẫn, vui lòng liên hệ với chúng tôi để được hỗ trợ.</p>
+            <hr style="border:0;border-top:1px solid #eee;margin:20px 0"/>
+            <p style="color:#999;font-size:12px;text-align:center">LexiGrow © 2026 - Measured Writing Growth</p>
+          </div>
+        `,
+      })
+    } catch (err) {
+      console.error('[ADMIN] Failed to send rejection email:', err.message)
+    }
+    res.status(200).json({ success: true, data: sanitize(user) })
+  }
 })
 
 // ─────────────────────────────────────────────────────────────
 // POST /api/admin/approvals/:id/verify-via-student
 // ─────────────────────────────────────────────────────────────
-export const sendStudentVerification = asyncHandler(async (req, res) => {
+export const VERIFICATION_RESEND_COOLDOWN_MS = 10 * 60 * 1000
+
+// Serialized by the admin mutation lock so two quick clicks (or two admins)
+// cannot both pass the duplicate check below.
+export const sendStudentVerification = adminMutationHandler(async (req, res) => {
   const parent = await User.findById(req.params.id)
   if (!parent) throw new ErrorResponse('Parent user not found', 404)
   if (parent.role !== 'parent') throw new ErrorResponse('User is not a parent account', 400)
@@ -472,24 +514,44 @@ export const sendStudentVerification = asyncHandler(async (req, res) => {
     throw new ErrorResponse('No children associated with this parent', 400)
   }
 
+  const toIdString = ref => String(ref?._id ?? ref ?? '')
   const requestedChildId = req.body?.childId
-  const isPresent = requestedChildId && parent.children.some(c => (c?._id || c).toString() === requestedChildId.toString())
+  const isPresent = requestedChildId && parent.children.some(c => toIdString(c) === String(requestedChildId))
   if (requestedChildId && !isPresent) {
     throw new ErrorResponse('Child is not associated with this parent', 400)
   }
-  const fallbackChildId = parent.children[0]?._id || parent.children[0]
+  const fallbackChildId = toIdString(parent.children[0])
   const childId = isPresent ? requestedChildId : fallbackChildId
   const child = await User.findById(childId)
   if (!child || child.role !== 'student' || child.accountStatus !== 'active') {
     throw new ErrorResponse('Child student not found', 404)
   }
 
+  // An unanswered request is still in the student's bell; another one would
+  // only stack a duplicate notification.
+  const recentRequest = await Notification.findOne({
+    recipient: child._id,
+    relatedUser: parent._id,
+    type: 'parent_notice',
+    isRead: false,
+    createdAt: { $gte: new Date(Date.now() - VERIFICATION_RESEND_COOLDOWN_MS) },
+  }).select('createdAt').lean()
+  if (recentRequest) {
+    const waitMs = new Date(recentRequest.createdAt).getTime() + VERIFICATION_RESEND_COOLDOWN_MS - Date.now()
+    const waitMinutes = Math.max(1, Math.ceil(waitMs / 60000))
+    throw new ErrorResponse(
+      `A verification request is already waiting for this student. Try again in ${waitMinutes} minute(s).`,
+      429,
+      'VERIFICATION_ALREADY_SENT',
+    )
+  }
+
   // Create verification notification for the student
   const notification = await Notification.create({
     recipient: child._id,
     sender: req.user._id,
-    title: 'Parent Verification Request',
-    message: `Parent ${parent.name} (${parent.email}) wants to link to your account. Please confirm.`,
+    title: 'Xác nhận liên kết phụ huynh',
+    message: `Phụ huynh ${parent.name} (${parent.email}) muốn liên kết với tài khoản của bạn. Vui lòng xác nhận.`,
     type: 'parent_notice',
     link: '',
     relatedUser: parent._id,
@@ -517,5 +579,5 @@ export const sendStudentVerification = asyncHandler(async (req, res) => {
     childEmail: child.email,
   })
 
-  res.status(200).json({ success: true, data: sanitize(parent) })
+  return () => res.status(200).json({ success: true, data: sanitize(parent) })
 })

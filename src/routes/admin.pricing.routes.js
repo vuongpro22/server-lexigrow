@@ -4,6 +4,7 @@ import {
   adminCreatePlan,
   adminUpdatePlan,
   adminDeletePlan,
+  adminGetPricingStats,
   adminGetTransactions,
   adminGetSubscriptions,
   adminGrantSubscription,
@@ -25,6 +26,7 @@ router.route('/plans/:id')
   .put(adminUpdatePlan)
   .delete(adminDeletePlan)
 
+router.get('/stats', adminGetPricingStats)
 router.get('/transactions', adminGetTransactions)
 router.get('/subscriptions', adminGetSubscriptions)
 router.post('/grant-subscription', adminGrantSubscription)

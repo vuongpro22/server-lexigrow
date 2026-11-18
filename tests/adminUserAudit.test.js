@@ -3,7 +3,14 @@ import { vi, describe, it, expect, beforeEach } from 'vitest'
 vi.mock('../src/models/Essay.js', () => ({ default: { updateMany: vi.fn().mockResolvedValue({ modifiedCount: 0 }) } }))
 
 // Controller-only tests; cross-process locking is exercised against MongoDB in adminMutationConcurrency.test.js.
-vi.mock('../src/services/adminMutationLock.service.js', () => ({ withAdminMutationLock: operation => operation() }))
+// The mock tracks whether the lock is held so tests can assert what runs inside it.
+const lockState = vi.hoisted(() => ({ held: false }))
+vi.mock('../src/services/adminMutationLock.service.js', () => ({
+  withAdminMutationLock: async operation => {
+    lockState.held = true
+    try { return await operation() } finally { lockState.held = false }
+  },
+}))
 
 vi.mock('../src/config/db.js', () => ({
   default: vi.fn().mockImplementation(() => Promise.resolve()),
@@ -17,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   auditCreate: vi.fn(),
   sendEmail: vi.fn(),
   notificationCreate: vi.fn(),
+  notificationFindOne: vi.fn(),
   notificationDeleteMany: vi.fn(),
   childLinkCodeDeleteMany: vi.fn(),
   sendNotificationToUser: vi.fn(),
@@ -68,6 +76,9 @@ vi.mock('../src/models/AuditLog.js', () => ({
 vi.mock('../src/models/Notification.js', () => ({
   default: {
     create: (...a) => mocks.notificationCreate(...a),
+    findOne: (...a) => ({
+      select: () => ({ lean: () => Promise.resolve(mocks.notificationFindOne(...a)) }),
+    }),
     deleteMany: (...a) => mocks.notificationDeleteMany(...a),
   },
 }))
@@ -125,6 +136,7 @@ beforeEach(() => {
   mocks.syncParentLinkedRooms.mockResolvedValue(undefined)
   mocks.disconnectUserSockets.mockResolvedValue(undefined)
   mocks.sendEmail.mockResolvedValue(true)
+  mocks.notificationFindOne.mockReturnValue(null)
   mocks.notificationCreate.mockImplementation((doc) => Promise.resolve({
     _id: 'notif_1', toObject: () => ({ _id: 'notif_1', ...doc }),
   }))
@@ -145,6 +157,54 @@ describe('admin user actions write an audit entry', () => {
       targetId: 'user_1',
       details: expect.objectContaining({ oldStatus: 'active', newStatus: 'suspended', note: 'spam' }),
     }))
+  })
+
+  it('rejects transitioning an active user back to pending_approval or exceeding statusNote length', async () => {
+    const activeUser = makeUser({ accountStatus: 'active' })
+    mocks.userFindById.mockResolvedValue(activeUser)
+
+    await request(app)
+      .patch('/api/admin/users/user_1/status')
+      .send({ status: 'pending_approval' })
+      .expect(422)
+    expect(activeUser.save).not.toHaveBeenCalled()
+
+    await request(app)
+      .patch('/api/admin/users/user_1/status')
+      .send({ status: 'suspended', note: 'x'.repeat(501) })
+      .expect(400)
+    expect(activeUser.save).not.toHaveBeenCalled()
+  })
+
+  it('rejects a non-string status note with a type error, not a length error', async () => {
+    const activeUser = makeUser({ accountStatus: 'active' })
+    mocks.userFindById.mockResolvedValue(activeUser)
+
+    const res = await request(app)
+      .patch('/api/admin/users/user_1/status')
+      .send({ status: 'suspended', note: null })
+      .expect(400)
+    expect(res.body.error).toBe('Status note must be a string')
+    expect(activeUser.save).not.toHaveBeenCalled()
+  })
+
+  it('stores the same trimmed password it validated', async () => {
+    const user = makeUser()
+    mocks.userFindById.mockResolvedValue(user)
+
+    await request(app)
+      .post('/api/admin/users/user_1/reset-password')
+      .send({ newPassword: '  abcdef  ' })
+      .expect(200)
+    expect(user.password).toBe('abcdef')
+
+    const shortUser = makeUser()
+    mocks.userFindById.mockResolvedValue(shortUser)
+    await request(app)
+      .post('/api/admin/users/user_1/reset-password')
+      .send({ newPassword: '   abc   ' })
+      .expect(400)
+    expect(shortUser.save).not.toHaveBeenCalled()
   })
 
   it('records a password reset without storing the password', async () => {
@@ -292,6 +352,65 @@ describe('admin user actions write an audit entry', () => {
     }))
   })
 
+  it('falls back to the default reason when the rejection reason is blank', async () => {
+    for (const body of [{}, { reason: '' }, { reason: '   ' }, { reason: null }]) {
+      mocks.sendEmail.mockClear()
+      mocks.auditCreate.mockClear()
+      mocks.userFindById.mockResolvedValue(makeUser())
+      await request(app).post('/api/admin/approvals/user_1/reject').send(body).expect(200)
+      expect(mocks.auditCreate).toHaveBeenCalledWith(expect.objectContaining({
+        details: expect.objectContaining({ reason: 'Không đáp ứng yêu cầu của hệ thống.' }),
+      }))
+      expect(mocks.sendEmail.mock.calls[0][0].message).toContain('Lý do: Không đáp ứng yêu cầu của hệ thống.')
+    }
+  })
+
+  it('trims the rejection reason before storing and emailing it', async () => {
+    mocks.userFindById.mockResolvedValue(makeUser())
+    await request(app).post('/api/admin/approvals/user_1/reject').send({ reason: '  thiếu giấy tờ  ' }).expect(200)
+    expect(mocks.auditCreate).toHaveBeenCalledWith(expect.objectContaining({
+      details: expect.objectContaining({ reason: 'thiếu giấy tờ' }),
+    }))
+  })
+
+  it('refuses a non-string or over-long rejection reason without touching the user', async () => {
+    const user = makeUser()
+    mocks.userFindById.mockResolvedValue(user)
+
+    const typed = await request(app).post('/api/admin/approvals/user_1/reject').send({ reason: { $ne: '' } })
+    expect(typed.status).toBe(400)
+    expect(typed.body.error).toBe('Rejection reason must be a string')
+
+    const long = await request(app).post('/api/admin/approvals/user_1/reject').send({ reason: 'x'.repeat(501) })
+    expect(long.status).toBe(400)
+    expect(long.body.error).toBe('Rejection reason cannot exceed 500 characters')
+
+    await request(app).post('/api/admin/approvals/user_1/reject').send({ reason: 'x'.repeat(500) }).expect(200)
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends approval and rejection emails after the admin mutation lock is released', async () => {
+    const heldDuringEmail = []
+    mocks.sendEmail.mockImplementation(async () => { heldDuringEmail.push(lockState.held) })
+
+    mocks.userFindById.mockResolvedValue(makeUser())
+    await request(app).post('/api/admin/approvals/user_1/approve').expect(200)
+    mocks.userFindById.mockResolvedValue(makeUser())
+    await request(app).post('/api/admin/approvals/user_1/reject').send({ reason: 'x' }).expect(200)
+
+    expect(heldDuringEmail).toEqual([false, false])
+  })
+
+  it('still approves when the approval email fails', async () => {
+    mocks.sendEmail.mockRejectedValue(new Error('SMTP down'))
+    mocks.userFindById.mockResolvedValue(makeUser())
+
+    const res = await request(app).post('/api/admin/approvals/user_1/approve')
+
+    expect(res.status).toBe(200)
+    expect(res.body.data.accountStatus).toBe('active')
+  })
+
   it('escapes the display name before it reaches the approval email HTML', async () => {
     mocks.userFindById.mockResolvedValue(makeUser({ name: '<img src=x onerror=alert(1)>' }))
 
@@ -422,6 +541,56 @@ describe('admin user actions write an audit entry', () => {
         childEmail: 'child2@example.com',
       }),
     }))
+  })
+
+  it('sends the student verification notification in Vietnamese', async () => {
+    const parent = makeUser({ _id: 'parent_1', role: 'parent', name: 'Phụ Huynh A', email: 'parent@example.com', children: ['child_1'] })
+    mocks.userFindById.mockImplementation((id) => (
+      id === 'parent_1' ? parent : makeUser({ _id: 'child_1', accountStatus: 'active' })
+    ))
+
+    await request(app).post('/api/admin/approvals/parent_1/verify-via-student').expect(200)
+
+    expect(mocks.notificationCreate).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Xác nhận liên kết phụ huynh',
+      message: 'Phụ huynh Phụ Huynh A (parent@example.com) muốn liên kết với tài khoản của bạn. Vui lòng xác nhận.',
+      type: 'parent_notice',
+      relatedUser: 'parent_1',
+    }))
+  })
+
+  it('does not stack a second verification while the first is still unanswered', async () => {
+    const parent = makeUser({ _id: 'parent_1', role: 'parent', children: ['child_1'] })
+    mocks.userFindById.mockImplementation((id) => (
+      id === 'parent_1' ? parent : makeUser({ _id: 'child_1', accountStatus: 'active' })
+    ))
+    mocks.notificationFindOne.mockReturnValue({ createdAt: new Date(Date.now() - 4 * 60 * 1000) })
+
+    const res = await request(app).post('/api/admin/approvals/parent_1/verify-via-student')
+
+    expect(res.status).toBe(429)
+    expect(res.body.error).toContain('6 minute')
+    expect(res.body.code).toBe('VERIFICATION_ALREADY_SENT')
+    expect(mocks.notificationCreate).not.toHaveBeenCalled()
+    expect(mocks.auditCreate).not.toHaveBeenCalled()
+    const [filter] = mocks.notificationFindOne.mock.calls[0]
+    expect(filter).toMatchObject({ recipient: 'child_1', relatedUser: 'parent_1', type: 'parent_notice', isRead: false })
+    expect(Date.now() - filter.createdAt.$gte.getTime()).toBeGreaterThanOrEqual(10 * 60 * 1000 - 1000)
+  })
+
+  it('runs the verification inside the admin mutation lock', async () => {
+    const parent = makeUser({ _id: 'parent_1', role: 'parent', children: ['child_1'] })
+    mocks.userFindById.mockImplementation((id) => (
+      id === 'parent_1' ? parent : makeUser({ _id: 'child_1', accountStatus: 'active' })
+    ))
+    let heldOnCreate = null
+    mocks.notificationCreate.mockImplementation(async (doc) => {
+      heldOnCreate = lockState.held
+      return { _id: 'notif_1', toObject: () => ({ _id: 'notif_1', ...doc }) }
+    })
+
+    await request(app).post('/api/admin/approvals/parent_1/verify-via-student').expect(200)
+    expect(heldOnCreate).toBe(true)
   })
 
   it('rejects student verification when childId is not associated with parent', async () => {

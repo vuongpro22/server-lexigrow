@@ -15,6 +15,7 @@ vi.mock('../src/utils/essayAccess.js', () => ({ canAccessChatRoom: vi.fn().mockR
 const { getChatRooms } = await import('../src/controllers/chat.controller.js')
 
 const mockRes = () => ({ status: vi.fn().mockReturnThis(), json: vi.fn() })
+const aggregateResult = (rooms = [], stats = []) => [{ rooms, stats }]
 
 // Room ids embed a user id, and the controller filters out anything that is not a
 // real ObjectId, so the fixtures must use valid hex ids.
@@ -42,20 +43,25 @@ describe('getChatRooms — bounded list and batched owners', () => {
       ownerCall += 1
       return ownerCall === 1 ? adminDistinct : ownerLean
     })
-    ChatMessage.aggregate.mockResolvedValue([
+    ChatMessage.aggregate.mockResolvedValue(aggregateResult([
       { _id: 'user:' + U1, lastMessageAt: new Date('2026-01-02'), unreadCount: 2, totalMessages: 5 },
       { _id: 'user:' + U2, lastMessageAt: new Date('2026-01-01'), unreadCount: 0, totalMessages: 1 },
       { _id: 'support', lastMessageAt: new Date('2026-01-01'), unreadCount: 0, totalMessages: 3 },
-    ])
+    ], [{ totalRooms: 203, privateRooms: 202, unreadMessages: 24 }]))
 
     const res = mockRes()
     await getChatRooms({ user: { role: 'admin' }, query: {} }, res, vi.fn())
 
     const pipeline = ChatMessage.aggregate.mock.calls[0][0]
-    expect(pipeline.some((stage) => '$limit' in stage)).toBe(true)
-    // default cap
-    expect(pipeline[pipeline.length - 1].$limit).toBe(200)
+    expect(pipeline.some((stage) => '$facet' in stage)).toBe(true)
+    const facet = pipeline.find((stage) => '$facet' in stage).$facet
+    expect(facet.rooms.at(-1)).toEqual({ $limit: 200 })
+    expect(facet.stats.find((stage) => '$group' in stage).$group).toMatchObject({
+      totalRooms: { $sum: 1 },
+      unreadMessages: { $sum: '$unreadCount' },
+    })
     expect(User.findById).not.toHaveBeenCalled()
+    expect(res.json.mock.calls[0][0].stats).toEqual({ totalRooms: 203, privateRooms: 202, unreadMessages: 24 })
     expect(res.json.mock.calls[0][0].data).toEqual([
       expect.objectContaining({ room: 'user:' + U1, roomType: 'private', user: expect.objectContaining({ name: 'An' }) }),
       expect.objectContaining({ room: 'user:' + U2, roomType: 'private', user: expect.objectContaining({ name: 'Binh' }) }),
@@ -64,15 +70,24 @@ describe('getChatRooms — bounded list and batched owners', () => {
   })
 
   it('clamps a hostile limit and ignores a non-numeric one', async () => {
-    ChatMessage.aggregate.mockResolvedValue([])
+    ChatMessage.aggregate.mockResolvedValue(aggregateResult())
     await getChatRooms({ user: { role: 'admin' }, query: { limit: '999999' } }, mockRes(), vi.fn())
     let pipeline = ChatMessage.aggregate.mock.calls[0][0]
-    expect(pipeline[pipeline.length - 1].$limit).toBe(500)
+    expect(pipeline.find((stage) => '$facet' in stage).$facet.rooms.at(-1).$limit).toBe(500)
 
     ChatMessage.aggregate.mockClear()
     await getChatRooms({ user: { role: 'admin' }, query: { limit: 'abc' } }, mockRes(), vi.fn())
     pipeline = ChatMessage.aggregate.mock.calls[0][0]
-    expect(pipeline[pipeline.length - 1].$limit).toBe(200)
+    expect(pipeline.find((stage) => '$facet' in stage).$facet.rooms.at(-1).$limit).toBe(200)
+  })
+
+  it('returns zero global stats when no chat messages exist', async () => {
+    ChatMessage.aggregate.mockResolvedValue(aggregateResult())
+    const res = mockRes()
+
+    await getChatRooms({ user: { role: 'admin' }, query: {} }, res, vi.fn())
+
+    expect(res.json.mock.calls[0][0].stats).toEqual({ totalRooms: 0, privateRooms: 0, unreadMessages: 0 })
   })
 
   it('still refuses non-admin callers', async () => {
