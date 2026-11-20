@@ -8,6 +8,10 @@ import {
   updateAIProvider,
   deleteAIProvider,
   testAIProvider,
+  addAIProviderKey,
+  updateAIProviderKey,
+  deleteAIProviderKey,
+  testAIProviderKey,
   listAIModels,
   createAIModel,
   updateAIModel,
@@ -37,4 +41,8 @@ router.post('/combos/:id/activate', activateAICombo)
 router.patch('/:id', updateAIProvider)
 router.delete('/:id', deleteAIProvider)
 router.post('/:id/test', testAIProvider)
+router.post('/:id/keys', addAIProviderKey)
+router.patch('/:id/keys/:keyId', updateAIProviderKey)
+router.delete('/:id/keys/:keyId', deleteAIProviderKey)
+router.post('/:id/keys/:keyId/test', testAIProviderKey)
 export default router

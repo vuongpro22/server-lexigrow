@@ -144,6 +144,18 @@ describe('verifySuggestionEvidence', () => {
   })
 })
 
+describe('suggestion errorCategory', () => {
+  it('keeps a known category code and drops unknown ones or those on strengths', () => {
+    const base = validAnalysis().suggestions[0]
+    const { suggestions } = verifySuggestionEvidence([
+      { ...base, type: 'improvement', errorCategory: 'Verb_Tense' },
+      { ...base, type: 'improvement', errorCategory: 'invented' },
+      { ...base, type: 'strength', errorCategory: 'article' },
+    ], essay)
+    expect(suggestions.map((item) => item.errorCategory)).toEqual(['verb_tense', '', ''])
+  })
+})
+
 describe('verifyTargetWordEvidence', () => {
   it('requires an authentic quote that contains the evaluated target word', () => {
     const checked = verifyTargetWordEvidence([

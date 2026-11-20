@@ -65,21 +65,57 @@ function retryAfterMs(error) {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0
 }
 
+// Socket errors raised before a request reaches the provider. The provider
+// cannot have processed (or billed) the request, so another provider is safe.
+const CONNECT_FAILURE_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT'])
+
+function connectFailureCode(error) {
+  let current = error
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    const code = String(current.code || '').toUpperCase()
+    if (CONNECT_FAILURE_CODES.has(code)) return code
+    current = current.cause
+  }
+  return ''
+}
+
 export function classifyProviderError(error) {
   if (error instanceof AIProviderError) return error
   const status = Number(error?.status || error?.statusCode || error?.response?.status || 0)
   const code = String(error?.code || error?.error?.code || '').toUpperCase()
   const message = error?.message || 'AI provider request failed'
   const rateLimited = status === 429 || /RATE[_ -]?LIMIT|QUOTA|THROTTL|RESOURCE_EXHAUSTED/i.test(`${code} ${message}`)
-  const timedOut = error?.name === 'AbortError' || ['ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(code) || /timeout|timed out/i.test(message)
-  const network = timedOut || ['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT'].includes(code) || /fetch failed|network/i.test(message)
+  // Gemini answers an invalid key with HTTP 400 API_KEY_INVALID instead of 401.
+  const authFailed = !rateLimited && (status === 401 || status === 403
+    || (status === 400 && /API[_ ]?KEY[_ ]?(INVALID|NOT[_ ]VALID|EXPIRED)|API key not valid|API key expired/i.test(`${code} ${message}`)))
+  const connectFailed = !rateLimited && !authFailed && Boolean(connectFailureCode(error))
+  const timedOut = !connectFailed && (error?.name === 'AbortError' || error?.name === 'APIConnectionTimeoutError' || code === 'ETIMEDOUT' || /timeout|timed out/i.test(message))
+  const network = connectFailed || timedOut || code === 'ECONNRESET' || /fetch failed|network|connection error/i.test(message)
+  const modelNotFound = status === 404
   const retryable = rateLimited || network || status >= 500 || status === 408
   return new AIProviderError(message, {
-    status: status || (network ? 504 : 502),
-    code: rateLimited ? 'RATE_LIMITED' : timedOut ? 'TIMEOUT' : network ? 'NETWORK_ERROR' : status >= 500 ? 'UPSTREAM_ERROR' : 'AI_REQUEST_ERROR',
+    status: status || (connectFailed ? 503 : network ? 504 : 502),
+    code: rateLimited ? 'RATE_LIMITED'
+      : authFailed ? 'AUTH_FAILED'
+        : connectFailed ? 'CONNECTION_FAILED'
+          : timedOut ? 'TIMEOUT'
+            : network ? 'NETWORK_ERROR'
+              : modelNotFound ? 'MODEL_NOT_FOUND'
+                : status >= 500 ? 'UPSTREAM_ERROR' : 'AI_REQUEST_ERROR',
     retryable,
     retryAfterMs: retryAfterMs(error),
   })
+}
+
+// Where a failed attempt sends the request next:
+//  - 'key'      the key itself is bad or throttled: try the provider's next key
+//  - 'provider' the provider is unreachable or lacks the model: try the next provider
+//  - 'stop'     the request is invalid, or may already have been processed (AI-09)
+export function failoverScope(error, mayHaveProcessed) {
+  if (mayHaveProcessed) return 'stop'
+  if (error.code === 'AUTH_FAILED' || error.code === 'RATE_LIMITED') return 'key'
+  if (error.code === 'CONNECTION_FAILED' || error.code === 'MODEL_NOT_FOUND' || error.retryable) return 'provider'
+  return 'stop'
 }
 
 function modelForAccount(account, requestedModel) {
@@ -163,6 +199,61 @@ function accountSafe(account) {
   return account?.name || `${account?.provider || 'legacy'}:${account?.model || 'unknown'}`
 }
 
+// A provider gets up to this many keys per request before the gateway moves on
+// to the next provider; the total bounds a request whose keys all fail fast.
+const MAX_KEYS_PER_PROVIDER = 5
+const MAX_TOTAL_PROVIDER_CALLS = 15
+
+const isCoolingDown = (item, now = Date.now()) => Boolean(item?.cooldownUntil && new Date(item.cooldownUntil).getTime() > now)
+
+function markKeyDecryptionFailed(account, keyId) {
+  const now = new Date()
+  const update = keyId
+    ? AIProviderAccount.updateOne(
+      { _id: account._id },
+      { $set: { 'apiKeys.$[k].needsAttention': true, 'apiKeys.$[k].lastErrorCode': 'KEY_DECRYPTION_FAILED', 'apiKeys.$[k].lastErrorAt': now } },
+      { arrayFilters: [{ 'k._id': keyId }] },
+    )
+    : AIProviderAccount.updateOne(
+      { _id: account._id },
+      { $set: { needsAttention: true, lastErrorCode: 'KEY_DECRYPTION_FAILED', lastErrorAt: now } },
+    )
+  return Promise.resolve(update).catch(() => {})
+}
+
+// Usable keys of a stored account, least recently used first so traffic spreads
+// across keys. Accounts that predate multi-key support expose their single
+// legacy key with keyId null; its health is tracked on the account itself.
+async function resolveAccountKeys(account, now = Date.now()) {
+  const stored = Array.isArray(account.apiKeys) ? account.apiKeys : []
+  const entries = stored.length
+    ? stored
+      .map((key, index) => ({ key, index }))
+      .filter(({ key }) => key.enabled !== false && !key.needsAttention && !isCoolingDown(key, now) && key.encryptedKey)
+      .sort((a, b) => (new Date(a.key.lastUsedAt || 0) - new Date(b.key.lastUsedAt || 0)) || a.index - b.index)
+      .map(({ key, index }) => ({ keyId: key._id, label: key.label || `#${index + 1}`, encryptedKey: key.encryptedKey, consecutiveFailures: key.consecutiveFailures || 0 }))
+    : account.encryptedApiKey
+      ? [{ keyId: null, label: '', encryptedKey: account.encryptedApiKey, consecutiveFailures: account.consecutiveFailures || 0 }]
+      : []
+  const keys = []
+  for (const { encryptedKey, ...entry } of entries) {
+    try {
+      keys.push({ ...entry, apiKey: decryptSecret(encryptedKey) })
+    } catch {
+      console.warn(`Skipping an API key of AI provider account ${account.name || account._id}: invalid encrypted key`)
+      await markKeyDecryptionFailed(account, entry.keyId)
+    }
+  }
+  return keys
+}
+
+function withoutSecrets(account) {
+  const rest = { ...account }
+  delete rest.apiKeys
+  delete rest.encryptedApiKey
+  return rest
+}
+
 async function legacyAccount(providerPreference, requestedModel) {
   const keys = {
     groq: ['GROQ_API_KEY', 'GROQ_API_KEY'],
@@ -198,7 +289,7 @@ async function legacyAccount(providerPreference, requestedModel) {
         ? (process.env.GEMINI_MODEL || 'gemini-2.5-flash')
         : (process.env.OPENAI_MODEL || 'gpt-4o-mini'),
     baseUrl: provider === 'openai-compatible' ? (process.env.OPENAI_BASE_URL || '') : '',
-    apiKey,
+    keys: [{ keyId: null, label: '', apiKey, consecutiveFailures: 0 }],
     routes: [],
     priority: 1000,
   }
@@ -233,24 +324,19 @@ async function comboCandidates({ route, model, schema }) {
   for (const candidate of ordered) {
     const providerModel = await AIProviderModel.findOne({ _id: candidate.model, enabled: true }).lean()
     if (!providerModel || (schema && !providerModel.capabilities?.structuredSchema && !providerModel.capabilities?.jsonMode)) continue
-    const account = await AIProviderAccount.findOne({ _id: providerModel.account, enabled: true }).select('+encryptedApiKey').lean()
-    if (!account || account.needsAttention || (account.cooldownUntil && new Date(account.cooldownUntil) > new Date())) continue
-    try {
-      resolved.push({
-        ...account,
-        provider: account.provider,
-        model: providerModel.modelId,
-        apiKey: decryptSecret(account.encryptedApiKey),
-        inputCostPerMillionUsd: providerModel.inputCostPerMillionUsd ?? account.inputCostPerMillionUsd,
-        outputCostPerMillionUsd: providerModel.outputCostPerMillionUsd ?? account.outputCostPerMillionUsd,
-        comboId: combo._id,
-      })
-    } catch {
-      await AIProviderAccount.updateOne(
-        { _id: account._id },
-        { $set: { needsAttention: true, lastErrorCode: 'KEY_DECRYPTION_FAILED', lastErrorAt: new Date() } },
-      )
-    }
+    const account = await AIProviderAccount.findOne({ _id: providerModel.account, enabled: true }).select('+encryptedApiKey +apiKeys.encryptedKey').lean()
+    if (!account || account.needsAttention || isCoolingDown(account)) continue
+    const keys = await resolveAccountKeys(account)
+    if (!keys.length) continue
+    resolved.push({
+      ...withoutSecrets(account),
+      provider: account.provider,
+      model: providerModel.modelId,
+      keys,
+      inputCostPerMillionUsd: providerModel.inputCostPerMillionUsd ?? account.inputCostPerMillionUsd,
+      outputCostPerMillionUsd: providerModel.outputCostPerMillionUsd ?? account.outputCostPerMillionUsd,
+      comboId: combo._id,
+    })
   }
   const pool = [...resolved]
   if (!pool.some((account) => account.provider === 'groq')) {
@@ -271,20 +357,14 @@ async function storedGroqFallbacks(route, model, excludedIds = new Set()) {
   if (AIProviderAccount.db.readyState !== 1) return []
   const query = { provider: 'groq', enabled: true, needsAttention: { $ne: true } }
   if (route) query.$or = [{ routes: route }, { routes: { $size: 0 } }]
-  const stored = await AIProviderAccount.find(query).select('+encryptedApiKey').sort({ priority: 1, _id: 1 }).lean()
-  return stored.flatMap((account) => {
-    if (excludedIds.has(String(account._id)) || (account.cooldownUntil && new Date(account.cooldownUntil) > new Date())) return []
-    try {
-      return [{ ...account, apiKey: decryptSecret(account.encryptedApiKey), model: account.model || model }]
-    } catch {
-      console.warn(`Skipping AI provider account ${account.name || account._id}: invalid encrypted key`)
-      void AIProviderAccount.updateOne(
-        { _id: account._id },
-        { $set: { needsAttention: true, lastErrorCode: 'KEY_DECRYPTION_FAILED', lastErrorAt: new Date() } },
-      )
-      return []
-    }
-  })
+  const stored = await AIProviderAccount.find(query).select('+encryptedApiKey +apiKeys.encryptedKey').sort({ priority: 1, _id: 1 }).lean()
+  const pool = []
+  for (const account of stored) {
+    if (excludedIds.has(String(account._id)) || isCoolingDown(account)) continue
+    const keys = await resolveAccountKeys(account)
+    if (keys.length) pool.push({ ...withoutSecrets(account), keys, model: account.model || model })
+  }
+  return pool
 }
 
 async function candidates({ route, providerPreference, model, schema }) {
@@ -300,9 +380,18 @@ async function candidates({ route, providerPreference, model, schema }) {
   return { pool: groqAccounts, policy: { maxAttempts: DEFAULT_MAX_ATTEMPTS, timeoutMs: 30000, maxCostUsd: null } }
 }
 
+// One shared import per SDK: concurrent first calls (e.g. testing several keys
+// at once) must not each start their own module load.
+let groqSdkPromise
+let geminiSdkPromise
+const loadGroqSdk = () => (groqSdkPromise ||= import('groq-sdk'))
+const loadGeminiSdk = () => (geminiSdkPromise ||= import('@google/generative-ai'))
+
 async function groqChat(account, { messages, model, responseFormat, temperature, maxTokens = 4096, timeoutMs = 30000, signal }) {
-  const Groq = (await import('groq-sdk')).default
-  const client = new Groq({ apiKey: account.apiKey, timeout: timeoutMs })
+  const Groq = (await loadGroqSdk()).default
+  // maxRetries: 0 — the gateway owns retries. The SDK default (2) would retry
+  // the same throttled or expired key before the gateway could switch keys.
+  const client = new Groq({ apiKey: account.apiKey, timeout: timeoutMs, maxRetries: 0 })
   const response = await client.chat.completions.create({
     messages,
     model: modelForAccount(account, model),
@@ -378,7 +467,10 @@ async function openAICompatibleChat(account, { messages, model, responseFormat, 
     )
     const isRateLimited = response.status === 429 || /rate[_ -]?limit|tokens per minute|too many requests/i.test(`${errCode} ${errMsg}`)
 
-    if (_attempt < 2 && (isJsonValidateFailed || isRateLimited || response.status >= 500)) {
+    // A throttled key with a sibling key available fails fast so the gateway
+    // switches keys instead of sleeping on the same key.
+    const retrySameKeyOnRateLimit = isRateLimited && !account.hasAlternateKey
+    if (_attempt < 2 && (isJsonValidateFailed || retrySameKeyOnRateLimit || response.status >= 500)) {
       if (isRateLimited || response.status >= 500) {
         const msgWaitMatch = errMsg.match(/try again in ([0-9.]+)s/i)
         const msgWaitMs = msgWaitMatch ? Math.ceil(Number(msgWaitMatch[1]) * 1000) : 0
@@ -402,7 +494,10 @@ async function openAICompatibleChat(account, { messages, model, responseFormat, 
 
     throw new AIProviderError(errMsg ? `OpenAI-compatible provider request failed: ${errMsg}` : 'OpenAI-compatible provider request failed', {
       status: response.status,
-      code: isRateLimited ? 'RATE_LIMITED' : 'AI_REQUEST_ERROR',
+      code: isRateLimited ? 'RATE_LIMITED'
+        : [401, 403].includes(response.status) ? 'AUTH_FAILED'
+          : response.status === 404 ? 'MODEL_NOT_FOUND'
+            : response.status >= 500 ? 'UPSTREAM_ERROR' : 'AI_REQUEST_ERROR',
       retryable: isRateLimited || isJsonValidateFailed || response.status >= 500,
       retryAfterMs: retryAfterMs(response),
     })
@@ -425,7 +520,7 @@ async function openAICompatibleChat(account, { messages, model, responseFormat, 
 }
 
 async function geminiStructured(account, { prompt, messages, schema, model, responseFormat, maxTokens = 4096, temperature = 0.1, timeoutMs = 30000 }) {
-  const { GoogleGenerativeAI } = await import('@google/generative-ai')
+  const { GoogleGenerativeAI } = await loadGeminiSdk()
   const ai = new GoogleGenerativeAI(account.apiKey)
   const contents = prompt || (messages || []).map((message) => `${message.role}: ${message.content}`).join('\n\n')
   const wantsJson = Boolean(schema || responseFormat?.type === 'json_object')
@@ -475,9 +570,11 @@ async function callAccount(account, options) {
   throw new AIProviderError(`Provider ${account.provider} does not support chat completion`, { status: 400, code: 'UNSUPPORTED_PROVIDER' })
 }
 
-export async function testAIProviderAccount(accountDocument, prompt = 'Reply with the word OK.') {
+// Sends a tiny prompt with one key. `encryptedKey` picks a key of a multi-key
+// account; without it the legacy single key is used.
+export async function testAIProviderAccount(accountDocument, { encryptedKey, prompt = 'Reply with the word OK.' } = {}) {
   const account = accountDocument.toObject ? accountDocument.toObject() : { ...accountDocument }
-  account.apiKey = decryptSecret(account.encryptedApiKey)
+  account.apiKey = decryptSecret(encryptedKey || account.encryptedApiKey)
   const result = await callAccount(account, {
     prompt,
     messages: [{ role: 'user', content: prompt }],
@@ -488,6 +585,63 @@ export async function testAIProviderAccount(accountDocument, prompt = 'Reply wit
     timeoutMs: 10000,
   })
   return { provider: account.provider, model: modelForAccount(account), usage: result.usage }
+}
+
+function backoffMs(error, failures) {
+  return error.retryAfterMs || (error.retryable ? Math.min(15 * 60 * 1000, 30000 * 2 ** Math.min(failures || 0, 4)) : 0)
+}
+
+async function recordAttemptSuccess(account, key) {
+  const now = new Date()
+  const $set = { lastUsedAt: now, consecutiveFailures: 0, lastErrorCode: '', needsAttention: false }
+  if (!key.keyId) {
+    await AIProviderAccount.updateOne({ _id: account._id }, { $set, $unset: { cooldownUntil: 1 } })
+    return
+  }
+  Object.assign($set, {
+    'apiKeys.$[k].lastUsedAt': now,
+    'apiKeys.$[k].consecutiveFailures': 0,
+    'apiKeys.$[k].lastErrorCode': '',
+    'apiKeys.$[k].needsAttention': false,
+    'apiKeys.$[k].cooldownUntil': null,
+  })
+  await AIProviderAccount.updateOne({ _id: account._id }, { $set, $unset: { cooldownUntil: 1 } }, { arrayFilters: [{ 'k._id': key.keyId }] })
+}
+
+// Key-scoped failures (expired/revoked key, per-key rate limit) are recorded on
+// that key only. Everything else, and every failure of a legacy single-key
+// account, is recorded on the account so the whole provider cools down.
+async function recordAttemptFailure(account, key, error, scope) {
+  const now = new Date()
+  if (scope === 'key' && key.keyId) {
+    const cooldown = error.code === 'RATE_LIMITED' ? backoffMs(error, key.consecutiveFailures) : 0
+    await AIProviderAccount.updateOne(
+      { _id: account._id },
+      {
+        $set: {
+          'apiKeys.$[k].lastErrorCode': error.code,
+          'apiKeys.$[k].lastErrorAt': now,
+          ...(error.code === 'AUTH_FAILED' ? { 'apiKeys.$[k].needsAttention': true } : {}),
+          ...(cooldown ? { 'apiKeys.$[k].cooldownUntil': new Date(now.getTime() + cooldown) } : {}),
+        },
+        $inc: { 'apiKeys.$[k].consecutiveFailures': 1 },
+      },
+      { arrayFilters: [{ 'k._id': key.keyId }] },
+    )
+    if (error.code === 'AUTH_FAILED') {
+      // Flag the account for admins once none of its enabled keys still works.
+      await AIProviderAccount.updateOne(
+        { _id: account._id, apiKeys: { $not: { $elemMatch: { enabled: { $ne: false }, needsAttention: { $ne: true } } } } },
+        { $set: { needsAttention: true, lastErrorCode: 'ALL_KEYS_FAILED', lastErrorAt: now } },
+      )
+    }
+    return
+  }
+  const cooldown = backoffMs(error, account.consecutiveFailures)
+  await AIProviderAccount.updateOne(
+    { _id: account._id },
+    { $set: { lastErrorCode: error.code, lastErrorAt: now, ...(error.code === 'AUTH_FAILED' ? { needsAttention: true } : {}), ...(cooldown ? { cooldownUntil: new Date(now.getTime() + cooldown) } : {}) }, $inc: { consecutiveFailures: 1 } },
+  )
 }
 
 export async function completeAI({
@@ -543,120 +697,122 @@ export async function completeAI({
     if (idempotencyClaim && Object.hasOwn(idempotencyClaim, 'replay')) return idempotencyClaim.replay
   }
 
-  for (const account of attemptPool) {
-    lastAccount = account
-    let projectedAttemptCost = null
-    const remainingMs = deadline - Date.now()
-    if (remainingMs <= 0) {
-      lastError = Object.assign(new AIProviderError('AI request exceeded its route timeout', { status: 504, code: 'TIMEOUT', retryable: false }), { mayHaveProcessed: false })
-      break
-    }
-    if (costLimit !== null) {
-      const projected = maximumAttemptCost(account, { messages: effectiveMessages, prompt: effectivePrompt, maxTokens })
-      projectedAttemptCost = projected
-      if (projected === null || reservedCost + projected > costLimit) {
-        lastError = new AIProviderError(projected === null
-          ? 'Cannot enforce route cost limit because provider pricing is unknown'
-          : 'Route cost limit reached before another provider attempt', { status: 429, code: 'AI_COST_LIMIT', retryable: false })
-        attempts.push({ account: accountSafe(account), status: 'skipped', code: lastError.code, mayHaveProcessed: false })
-        break
+  let providerCalls = 0
+  providerLoop:
+  for (const candidate of attemptPool) {
+    const { keys: candidateKeys = [], ...accountFields } = candidate
+    for (const key of candidateKeys.slice(0, MAX_KEYS_PER_PROVIDER)) {
+      if (providerCalls >= MAX_TOTAL_PROVIDER_CALLS) break providerLoop
+      providerCalls += 1
+      const account = { ...accountFields, apiKey: key.apiKey, hasAlternateKey: candidateKeys.length > 1 }
+      lastAccount = account
+      let projectedAttemptCost = null
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) {
+        lastError = Object.assign(new AIProviderError('AI request exceeded its route timeout', { status: 504, code: 'TIMEOUT', retryable: false }), { mayHaveProcessed: false })
+        break providerLoop
       }
-      // Reserve the maximum configured input/output spend before sending data.
-      // This also accounts conservatively for timed-out attempts that may be billed.
-      reservedCost += projected
-    }
-    const attemptStarted = Date.now()
-    let upstreamReturned = false
-    try {
-      const result = await callAccount(account, {
-        messages: effectiveMessages,
-        prompt: effectivePrompt,
-        schema,
-        model,
-        responseFormat: effectiveResponseFormat,
-        temperature,
-        maxTokens,
-        timeoutMs: Math.max(1, deadline - Date.now()),
-        requestId,
-      })
-      upstreamReturned = true
-      if (!account._legacy) {
-        await AIProviderAccount.updateOne(
-          { _id: account._id },
-          { $set: { lastUsedAt: new Date(), consecutiveFailures: 0, lastErrorCode: '', needsAttention: false }, $unset: { cooldownUntil: 1 } },
-        )
-      }
-      attempts.push({ account: accountSafe(account), status: 'success', durationMs: Date.now() - attemptStarted, cost: result.usage ? estimateCost({ provider: account.provider, model: modelForAccount(account, model), usage: result.usage, inputCostPerMillionUsd: account.inputCostPerMillionUsd, outputCostPerMillionUsd: account.outputCostPerMillionUsd }).cost : null })
-      const attemptSec = ((Date.now() - attemptStarted) / 1000).toFixed(2)
-      console.log(`[AI Gateway] ⏱️ [${route || 'ai'}] ${account.provider}:${modelForAccount(account, model)} phản hồi thành công trong ${attemptSec}s (${Date.now() - attemptStarted}ms)`)
-      const anyPriorMayHaveProcessed = attempts.slice(0, -1).some(a => a.mayHaveProcessed)
-      const successResult = {
-        text: result.text,
-        usage: normalizeUsage(result.usage),
-        usageAvailable: result.usage !== null && result.usage !== undefined,
-        cost: estimateCost({
-          provider: account.provider,
-          model: modelForAccount(account, model),
-          usage: result.usage,
-          inputCostPerMillionUsd: account.inputCostPerMillionUsd,
-          outputCostPerMillionUsd: account.outputCostPerMillionUsd,
-        }),
-        requestId,
-        provider: account.provider,
-        account: accountSafe(account),
-        model: modelForAccount(account, model),
-        durationMs: Date.now() - started,
-        attempts,
-        providerRequestId: result.providerRequestId || null,
-        possibly_processed: anyPriorMayHaveProcessed,
-      }
-      if (idempotencyClaim) {
-        try {
-          await AIRequest.updateOne(
-            { requestId, fingerprint: idempotencyClaim.fingerprint, state: 'processing' },
-            { $set: {
-              state: 'completed',
-              result: successResult,
-              leaseUntil: null,
-              expiresAt: new Date(Date.now() + AI_REQUEST_RETENTION_MS),
-            } },
-          )
-        } catch (error) {
-          await AIRequest.updateOne(
-            { requestId, fingerprint: idempotencyClaim.fingerprint, state: 'processing' },
-            { $set: {
-              state: 'possibly_processed',
-              leaseUntil: null,
-              expiresAt: new Date(Date.now() + AI_REQUEST_POSSIBLY_PROCESSED_RETENTION_MS),
-            } },
-          ).catch(() => {})
-          throw Object.assign(new AIProviderError('Provider completed the request but its idempotency record could not be saved', {
-            status: 503, code: 'AI_REQUEST_RECORD_FAILED', retryable: false,
-          }), { mayHaveProcessed: true, cause: error })
+      if (costLimit !== null) {
+        const projected = maximumAttemptCost(account, { messages: effectiveMessages, prompt: effectivePrompt, maxTokens })
+        projectedAttemptCost = projected
+        if (projected === null || reservedCost + projected > costLimit) {
+          lastError = new AIProviderError(projected === null
+            ? 'Cannot enforce route cost limit because provider pricing is unknown'
+            : 'Route cost limit reached before another provider attempt', { status: 429, code: 'AI_COST_LIMIT', retryable: false })
+          attempts.push({ account: accountSafe(account), key: key.label || undefined, status: 'skipped', code: lastError.code, mayHaveProcessed: false })
+          break providerLoop
         }
+        // Reserve the maximum configured input/output spend before sending data.
+        // This also accounts conservatively for timed-out attempts that may be billed.
+        reservedCost += projected
       }
-      const totalDurationSec = ((Date.now() - started) / 1000).toFixed(2)
-      console.log(`[AI Gateway] ✅ [${route || 'ai'}] Hoàn tất yêu cầu AI trong ${totalDurationSec}s (${Date.now() - started}ms)`)
-      return successResult
-    } catch (rawError) {
-      const error = classifyProviderError(rawError)
-      lastError = error
-      const mayHaveProcessed = Boolean(
-        upstreamReturned || rawError.mayHaveProcessed || error.mayHaveProcessed ||
-        error.code === 'TIMEOUT' || error.code === 'NETWORK_ERROR' || error.status >= 500,
-      )
-      attempts.push({ account: accountSafe(account), status: 'failure', code: error.code, statusCode: error.status, durationMs: Date.now() - attemptStarted, mayHaveProcessed, possibleChargeUsd: mayHaveProcessed ? projectedAttemptCost : null })
-      const attemptSec = ((Date.now() - attemptStarted) / 1000).toFixed(2)
-      console.warn(`[AI Gateway] ⚠️ [${route || 'ai'}] ${account?.provider || 'unknown'}:${modelForAccount(account, model)} thất bại sau ${attemptSec}s (${Date.now() - attemptStarted}ms): ${rawError?.message}`)
-      if (!account._legacy) {
-        const cooldown = error.retryAfterMs || (error.retryable ? Math.min(15 * 60 * 1000, 30000 * 2 ** Math.min(account.consecutiveFailures || 0, 4)) : 0)
-        await AIProviderAccount.updateOne(
-          { _id: account._id },
-          { $set: { lastErrorCode: error.code, lastErrorAt: new Date(), ...([401, 403].includes(error.status) ? { needsAttention: true } : {}), ...(cooldown ? { cooldownUntil: new Date(Date.now() + cooldown) } : {}) }, $inc: { consecutiveFailures: 1 } },
+      const attemptStarted = Date.now()
+      let upstreamReturned = false
+      try {
+        const result = await callAccount(account, {
+          messages: effectiveMessages,
+          prompt: effectivePrompt,
+          schema,
+          model,
+          responseFormat: effectiveResponseFormat,
+          temperature,
+          maxTokens,
+          timeoutMs: Math.max(1, deadline - Date.now()),
+          requestId,
+        })
+        upstreamReturned = true
+        if (!account._legacy) await recordAttemptSuccess(account, key)
+        attempts.push({ account: accountSafe(account), key: key.label || undefined, status: 'success', durationMs: Date.now() - attemptStarted, cost: result.usage ? estimateCost({ provider: account.provider, model: modelForAccount(account, model), usage: result.usage, inputCostPerMillionUsd: account.inputCostPerMillionUsd, outputCostPerMillionUsd: account.outputCostPerMillionUsd }).cost : null })
+        const attemptSec = ((Date.now() - attemptStarted) / 1000).toFixed(2)
+        console.log(`[AI Gateway] ⏱️ [${route || 'ai'}] ${account.provider}:${modelForAccount(account, model)} phản hồi thành công trong ${attemptSec}s (${Date.now() - attemptStarted}ms)`)
+        const anyPriorMayHaveProcessed = attempts.slice(0, -1).some(a => a.mayHaveProcessed)
+        const successResult = {
+          text: result.text,
+          usage: normalizeUsage(result.usage),
+          usageAvailable: result.usage !== null && result.usage !== undefined,
+          cost: estimateCost({
+            provider: account.provider,
+            model: modelForAccount(account, model),
+            usage: result.usage,
+            inputCostPerMillionUsd: account.inputCostPerMillionUsd,
+            outputCostPerMillionUsd: account.outputCostPerMillionUsd,
+          }),
+          requestId,
+          provider: account.provider,
+          account: accountSafe(account),
+          model: modelForAccount(account, model),
+          durationMs: Date.now() - started,
+          attempts,
+          providerRequestId: result.providerRequestId || null,
+          possibly_processed: anyPriorMayHaveProcessed,
+        }
+        if (idempotencyClaim) {
+          try {
+            await AIRequest.updateOne(
+              { requestId, fingerprint: idempotencyClaim.fingerprint, state: 'processing' },
+              { $set: {
+                state: 'completed',
+                result: successResult,
+                leaseUntil: null,
+                expiresAt: new Date(Date.now() + AI_REQUEST_RETENTION_MS),
+              } },
+            )
+          } catch (error) {
+            await AIRequest.updateOne(
+              { requestId, fingerprint: idempotencyClaim.fingerprint, state: 'processing' },
+              { $set: {
+                state: 'possibly_processed',
+                leaseUntil: null,
+                expiresAt: new Date(Date.now() + AI_REQUEST_POSSIBLY_PROCESSED_RETENTION_MS),
+              } },
+            ).catch(() => {})
+            throw Object.assign(new AIProviderError('Provider completed the request but its idempotency record could not be saved', {
+              status: 503, code: 'AI_REQUEST_RECORD_FAILED', retryable: false,
+            }), { mayHaveProcessed: true, cause: error })
+          }
+        }
+        const totalDurationSec = ((Date.now() - started) / 1000).toFixed(2)
+        console.log(`[AI Gateway] ✅ [${route || 'ai'}] Hoàn tất yêu cầu AI trong ${totalDurationSec}s (${Date.now() - started}ms)`)
+        return successResult
+      } catch (rawError) {
+        const error = classifyProviderError(rawError)
+        lastError = error
+        const mayHaveProcessed = Boolean(
+          upstreamReturned || rawError.mayHaveProcessed || error.mayHaveProcessed ||
+          (error.code !== 'CONNECTION_FAILED' && (error.code === 'TIMEOUT' || error.code === 'NETWORK_ERROR' || error.status >= 500)),
         )
+        const scope = failoverScope(error, mayHaveProcessed)
+        attempts.push({ account: accountSafe(account), key: key.label || undefined, status: 'failure', code: error.code, scope, statusCode: error.status, durationMs: Date.now() - attemptStarted, mayHaveProcessed, possibleChargeUsd: mayHaveProcessed ? projectedAttemptCost : null })
+        const attemptSec = ((Date.now() - attemptStarted) / 1000).toFixed(2)
+        console.warn(`[AI Gateway] ⚠️ [${route || 'ai'}] ${account?.provider || 'unknown'}:${modelForAccount(account, model)} thất bại sau ${attemptSec}s (${Date.now() - attemptStarted}ms): ${rawError?.message}`)
+        // An attempt the provider never processed cannot be billed: release its reservation.
+        if (!mayHaveProcessed && projectedAttemptCost) reservedCost = Math.max(0, reservedCost - projectedAttemptCost)
+        if (!account._legacy) await recordAttemptFailure(account, key, error, scope)
+        if (scope === 'key') continue
+        if (scope === 'provider') continue providerLoop
+        // AI-09: never fail over once the request may have been processed upstream (double billing).
+        break providerLoop
       }
-      // AI-09: Do not failover to a different provider if the request may have already been processed upstream to prevent double billing
-      if (!error.retryable || mayHaveProcessed) break
     }
   }
   if (idempotencyClaim) {
@@ -672,6 +828,7 @@ export async function completeAI({
       } },
     ).catch(() => {})
   }
+  if (!lastError) lastError = new AIProviderError('No usable AI provider key is configured', { status: 503, code: 'AI_NOT_CONFIGURED' })
   lastError.attempts = attempts
   lastError.requestId = requestId
   const failedAccount = lastAccount

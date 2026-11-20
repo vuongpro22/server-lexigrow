@@ -371,7 +371,7 @@ export const submitEssay = asyncHandler(async (req, res) => {
   }).catch(err => {
     Essay.updateOne(
       { _id: essay._id, revisionCounter: essay.revisionCounter ?? 0 },
-      { $set: { aiAnalysisStatus: 'failed', aiAnalysisRevision: essay.revisionCounter ?? 0 } },
+      { $set: { aiAnalysisStatus: 'failed', aiAnalysisRevision: essay.revisionCounter ?? 0, aiAnalysisProcessingUntil: null } },
     ).catch(statusErr => {
       console.error('Failed to persist essay grading failure state:', statusErr.message)
     })

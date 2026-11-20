@@ -16,6 +16,9 @@ const manualFeedbackSchema = new mongoose.Schema({
     vocabulary: { type: Number, min: 1, max: 10, default: 5 },
     coherence: { type: Number, min: 1, max: 10, default: 5 },
     complexity: { type: Number, min: 1, max: 10, default: 5 },
+    // Task response, the fifth criterion of the AI rubric. Feedback saved before
+    // it existed has no value; the overall score then averages the other four.
+    promptAdherence: { type: Number, min: 1, max: 10 },
   },
   feedbackText: {
     type: String,

@@ -10,6 +10,9 @@ const essaySchema = new mongoose.Schema({
     default: 'idle',
   },
   aiAnalysisRevision: { type: Number, default: -1 },
+  // Lease for aiAnalysisStatus 'processing'. Grading runs inside the API
+  // process; if that process dies, an expired lease lets the essay be regraded.
+  aiAnalysisProcessingUntil: { type: Date, default: null },
   title: {
     type: String,
     required: [true, 'Please add an essay title'],

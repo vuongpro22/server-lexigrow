@@ -73,6 +73,18 @@ const connectDB = async () => {
             account.encryptedApiKey = encryptSecret(plaintext)
             await account.save()
           }
+
+          const multiKeyAccounts = await AIProviderAccount.find({ 'apiKeys.0': { $exists: true } }).select('+apiKeys.encryptedKey')
+          for (const account of multiKeyAccounts) {
+            let changed = false
+            for (const key of account.apiKeys) {
+              if (!key.encryptedKey || (isEncryptedSecret(key.encryptedKey) && key.encryptedKey.startsWith('v2.'))) continue
+              const plaintext = isEncryptedSecret(key.encryptedKey) ? decryptSecret(key.encryptedKey) : String(key.encryptedKey)
+              key.encryptedKey = encryptSecret(plaintext)
+              changed = true
+            }
+            if (changed) await account.save()
+          }
         } catch (migErr) {
           console.error(`[AI Provider Migration Warning] ${migErr.message}`)
         }

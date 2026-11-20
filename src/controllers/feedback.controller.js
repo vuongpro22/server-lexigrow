@@ -57,13 +57,16 @@ async function assertCanGradeEssay(user, essay) {
  * produces a fake failing overall score.
  */
 const TEACHER_SCORE_KEYS = ['grammar', 'vocabulary', 'coherence', 'complexity']
+// Optional fifth criterion (task response). It mirrors the AI rubric so the
+// teacher overall score uses the same five-criteria average as the AI score.
+const OPTIONAL_TEACHER_SCORE_KEYS = ['promptAdherence']
 const DEFAULT_TEACHER_SCORE = 5
 
 function mergeTeacherScores(base, incoming) {
   const baseScores = typeof base?.toObject === 'function' ? base.toObject() : (base || {})
   const merged = { ...baseScores }
 
-  for (const key of TEACHER_SCORE_KEYS) {
+  for (const key of [...TEACHER_SCORE_KEYS, ...OPTIONAL_TEACHER_SCORE_KEYS]) {
     const candidate = incoming?.[key]
     if (candidate !== undefined && candidate !== null && Number.isFinite(Number(candidate))) {
       merged[key] = Number(candidate)
@@ -84,8 +87,10 @@ function mergeTeacherScores(base, incoming) {
  * Returns a number rounded to 1 decimal.
  */
 function computeTeacherOverallScore(scores) {
-  const { grammar, vocabulary, coherence, complexity } = mergeTeacherScores({}, scores)
-  return Math.round(((grammar + vocabulary + coherence + complexity) / 4) * 10) / 10
+  const merged = mergeTeacherScores({}, scores)
+  const parts = [merged.grammar, merged.vocabulary, merged.coherence, merged.complexity]
+  if (Number.isFinite(Number(merged.promptAdherence))) parts.push(Number(merged.promptAdherence))
+  return Math.round((parts.reduce((sum, value) => sum + value, 0) / parts.length) * 10) / 10
 }
 
 /**
@@ -111,6 +116,7 @@ async function syncTeacherScoresToAnalysis(essayId, scores) {
           coherence: normalizedScores.coherence,
           complexityIndex: normalizedScores.complexity,
           lexicalResource: normalizedScores.vocabulary,
+          ...(Number.isFinite(Number(normalizedScores.promptAdherence)) ? { promptAdherence: normalizedScores.promptAdherence } : {}),
           // vocabularyDiversity is TTR (0-1), keep default 0 to avoid constraint violation
           vocabularyDiversity: 0,
         },
@@ -123,6 +129,7 @@ async function syncTeacherScoresToAnalysis(essayId, scores) {
       analysis.scores.coherence = normalizedScores.coherence
       analysis.scores.complexityIndex = normalizedScores.complexity
       analysis.scores.lexicalResource = normalizedScores.vocabulary
+      if (Number.isFinite(Number(normalizedScores.promptAdherence))) analysis.scores.promptAdherence = normalizedScores.promptAdherence
     }
 
     await analysis.save()

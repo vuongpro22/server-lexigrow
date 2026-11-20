@@ -30,6 +30,11 @@ const suggestionSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  // Normalized grammar heatmap code (see utils/grammarCategory.js); '' if none.
+  errorCategory: {
+    type: String,
+    default: '',
+  },
 }, { _id: false })
 
 const aiAnalysisSchema = new mongoose.Schema({

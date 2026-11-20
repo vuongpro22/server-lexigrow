@@ -107,6 +107,17 @@ describe('draft feedback scores stay separate from published analysis', () => {
     expect(Essay.findByIdAndUpdate).toHaveBeenCalledWith('essay', { status: 'reviewed' }, { new: true })
   })
 
+  it('averages all five criteria, including task response, like the AI rubric', async () => {
+    const feedback = { essay: 'essay', status: 'draft', scores: { grammar: 8, vocabulary: 8, coherence: 8, complexity: 8, promptAdherence: 3 }, save: vi.fn().mockResolvedValue() }
+    ManualFeedback.findOne.mockResolvedValue(feedback)
+    const next = vi.fn()
+    await submitFeedback(request(), response(), next)
+    expect(next).not.toHaveBeenCalled()
+    expect(analysis.overallScore).toBe(7)
+    expect(analysis.scores.promptAdherence).toBe(3)
+    expect(analysis.scores.lexicalResource).toBe(8)
+  })
+
   it('creates an analysis for an unanalysed essay only when submitted', async () => {
     AIAnalysis.findOne.mockResolvedValue(null)
     const save = vi.fn().mockResolvedValue()

@@ -57,6 +57,23 @@ async function authorizedEssay(req, writing = false) {
  * @route   GET /api/essays/:essayId/analysis
  * @access  Private
  */
+// Essays graded before the lease existed have no aiAnalysisProcessingUntil;
+// their 'processing' state can only be left over from a dead process.
+const isProcessingLeaseExpired = (essay, now = Date.now()) => {
+  const until = essay.aiAnalysisProcessingUntil ? new Date(essay.aiAnalysisProcessingUntil).getTime() : 0
+  return until <= now
+}
+
+const expireStaleProcessing = (essay) => Essay.updateOne(
+  {
+    _id: essay._id,
+    aiAnalysisStatus: 'processing',
+    aiAnalysisRevision: essay.aiAnalysisRevision,
+    aiAnalysisProcessingUntil: essay.aiAnalysisProcessingUntil ?? null,
+  },
+  { $set: { aiAnalysisStatus: 'failed', aiAnalysisProcessingUntil: null } },
+).catch((err) => console.error('[AI Feedback] Could not release a stalled grading:', err.message))
+
 export const getAnalysis = asyncHandler(async (req, res) => {
   const essay = await authorizedEssay(req)
   if (!essay) throw new ErrorResponse('Essay not found', 404)
@@ -78,7 +95,13 @@ export const getAnalysis = asyncHandler(async (req, res) => {
   }
 
   if (statusMatchesCurrentRevision && essay.aiAnalysisStatus === 'processing') {
-    return res.status(200).json({ success: true, data: null, gradingStatus: 'processing' })
+    if (!isProcessingLeaseExpired(essay)) {
+      return res.status(200).json({ success: true, data: null, gradingStatus: 'processing' })
+    }
+    // The grading process died (e.g. a server restart): release the essay so
+    // the student sees the failure and can regrade instead of waiting forever.
+    await expireStaleProcessing(essay)
+    return res.status(200).json({ success: true, data: null, gradingStatus: 'failed', reason: 'AI_ANALYSIS_STALLED' })
   }
 
   const hasCompletedAnalysis = analysis && (isLegacyAnalysis || analysisMatchesCurrentEssay)
@@ -114,7 +137,7 @@ export const reanalyze = asyncHandler(async (req, res) => {
   }
 
   const currentRevision = essay.revisionCounter ?? 0
-  if (essay.aiAnalysisStatus === 'processing' && (essay.aiAnalysisRevision ?? -1) === currentRevision) {
+  if (essay.aiAnalysisStatus === 'processing' && (essay.aiAnalysisRevision ?? -1) === currentRevision && !isProcessingLeaseExpired(essay)) {
     throw new ErrorResponse('An AI analysis is already running for this essay revision', 409, 'AI_ANALYSIS_IN_PROGRESS')
   }
 
@@ -195,12 +218,12 @@ export const reanalyze = asyncHandler(async (req, res) => {
     throw new ErrorResponse('The essay changed while it was being analyzed; retry', 409, 'AI_ANALYSIS_SUPERSEDED')
   }
 
-  // Mark essay as reviewed
-  essay.status = 'reviewed'
-  await essay.save()
-
-  await settleDailyEssayQuota({ student: essay.student, requestId, day: quotaReservation.day, outcome: 'consume' })
-    .catch((quotaErr) => console.error('[Reanalyze] Quota consume failed:', quotaErr.message))
+  // Only a fresh, real grading costs a quota slot. A fallback (AI unavailable)
+  // or a previous grading served again must hand the reservation back. The
+  // essay status is left alone: only teacher feedback marks it 'reviewed'.
+  const chargeable = !analysis.isFallback && !analysis.servedFromPreviousGrading
+  await settleDailyEssayQuota({ student: essay.student, requestId, day: quotaReservation.day, outcome: chargeable ? 'consume' : 'release' })
+    .catch((quotaErr) => console.error(`[Reanalyze] Quota ${chargeable ? 'consume' : 'release'} failed:`, quotaErr.message))
 
   try {
     await awardEssayXp({

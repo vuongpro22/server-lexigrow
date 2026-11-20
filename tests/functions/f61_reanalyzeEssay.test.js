@@ -38,7 +38,7 @@ vi.mock('../../src/services/aiQuota.js', () => ({
 
 import Essay from '../../src/models/Essay.js'
 import { processEssayAnalysis } from '../../src/services/ai.service.js'
-import { reserveDailyEssayQuota } from '../../src/services/aiQuota.js'
+import { reserveDailyEssayQuota, settleDailyEssayQuota } from '../../src/services/aiQuota.js'
 import { reanalyze } from '../../src/controllers/analysis.controller.js'
 
 describe('F61: Reanalyze Essay (reanalyze)', () => {
@@ -46,7 +46,7 @@ describe('F61: Reanalyze Essay (reanalyze)', () => {
     vi.clearAllMocks()
   })
 
-  it('UTCID01 (N): should trigger reanalyze for submitted essay and mark reviewed', async () => {
+  it('UTCID01 (N): should trigger reanalyze for submitted essay without marking it teacher-reviewed', async () => {
     const saveMock = vi.fn().mockResolvedValue(true)
     const existingEssay = {
       _id: 'e_re_1',
@@ -65,8 +65,9 @@ describe('F61: Reanalyze Essay (reanalyze)', () => {
 
     expect(res.status).toHaveBeenCalledWith(200)
     expect(res.data.success).toBe(true)
-    expect(existingEssay.status).toBe('reviewed')
-    expect(saveMock).toHaveBeenCalled()
+    // Only teacher feedback marks an essay 'reviewed'; AI regrading keeps it pending.
+    expect(existingEssay.status).toBe('submitted')
+    expect(saveMock).not.toHaveBeenCalled()
   })
 
   it('UTCID02 (N): should allow reanalyzing an already reviewed essay (re-scoring)', async () => {
@@ -231,5 +232,56 @@ describe('F61: Reanalyze Essay (reanalyze)', () => {
     expect(err.code).toBe('DAILY_ESSAY_LIMIT_REACHED')
     expect(err.message).toContain('Daily AI essay limit reached (3)')
     expect(existingEssay.status).toBe('submitted')
+  })
+
+  it('consumes the quota slot only for a fresh real grading', async () => {
+    Essay.findById.mockResolvedValue({ _id: 'e_q1', student: 'student_1', content: 'text', status: 'submitted', save: vi.fn() })
+    processEssayAnalysis.mockResolvedValueOnce({ _id: 'a1', isFallback: false })
+    const { req, res, next } = createMockContext({ params: { essayId: 'e_q1' } })
+    await reanalyze(req, res, next)
+    expect(settleDailyEssayQuota).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'consume' }))
+  })
+
+  it('releases the quota slot when the AI fell back to an unscored result', async () => {
+    Essay.findById.mockResolvedValue({ _id: 'e_q2', student: 'student_1', content: 'text', status: 'submitted', save: vi.fn() })
+    processEssayAnalysis.mockResolvedValueOnce({ _id: 'a2', isFallback: true })
+    const { req, res, next } = createMockContext({ params: { essayId: 'e_q2' } })
+    await reanalyze(req, res, next)
+    expect(settleDailyEssayQuota).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'release' }))
+    expect(settleDailyEssayQuota).not.toHaveBeenCalledWith(expect.objectContaining({ outcome: 'consume' }))
+  })
+
+  it('releases the quota slot when a previous grading is served again', async () => {
+    Essay.findById.mockResolvedValue({ _id: 'e_q3', student: 'student_1', content: 'text', status: 'submitted', save: vi.fn() })
+    const preserved = { _id: 'a3', isFallback: false }
+    Object.defineProperty(preserved, 'servedFromPreviousGrading', { value: true })
+    processEssayAnalysis.mockResolvedValueOnce(preserved)
+    const { req, res, next } = createMockContext({ params: { essayId: 'e_q3' } })
+    await reanalyze(req, res, next)
+    expect(settleDailyEssayQuota).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'release' }))
+  })
+
+  it('rejects a reanalyze while a live grading holds the lease', async () => {
+    Essay.findById.mockResolvedValue({
+      _id: 'e_l1', student: 'student_1', content: 'text', status: 'submitted', save: vi.fn(),
+      revisionCounter: 0, aiAnalysisStatus: 'processing', aiAnalysisRevision: 0,
+      aiAnalysisProcessingUntil: new Date(Date.now() + 60_000),
+    })
+    const { req, res, next } = createMockContext({ params: { essayId: 'e_l1' } })
+    await reanalyze(req, res, next)
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 409 }))
+    expect(processEssayAnalysis).not.toHaveBeenCalled()
+  })
+
+  it('lets a student regrade an essay whose grading lease expired', async () => {
+    Essay.findById.mockResolvedValue({
+      _id: 'e_l2', student: 'student_1', content: 'text', status: 'submitted', save: vi.fn(),
+      revisionCounter: 0, aiAnalysisStatus: 'processing', aiAnalysisRevision: 0,
+      aiAnalysisProcessingUntil: new Date(Date.now() - 1000),
+    })
+    const { req, res, next } = createMockContext({ params: { essayId: 'e_l2' } })
+    await reanalyze(req, res, next)
+    expect(processEssayAnalysis).toHaveBeenCalled()
+    expect(res.status).toHaveBeenCalledWith(200)
   })
 })

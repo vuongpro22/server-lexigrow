@@ -18,9 +18,12 @@ const tokenize = (text) => {
  * Apply `.limit()` + `.lean()` when the query builder supports it, otherwise
  * return the query/promise unchanged (keeps unit-test doubles working).
  */
-const finalizeQuery = (query, limit) => {
+const finalizeQuery = (query, limit, sort) => {
   if (query && typeof query.lean === 'function') {
-    const bounded = typeof query.limit === 'function' ? query.limit(limit) : query
+    // Without a sort, limit() keeps whichever documents MongoDB returns first
+    // (usually the oldest), so recent essays would never be compared.
+    const ordered = sort && typeof query.sort === 'function' ? query.sort(sort) : query
+    const bounded = typeof ordered.limit === 'function' ? ordered.limit(limit) : ordered
     return bounded.lean()
   }
   return query
@@ -86,7 +89,7 @@ export const checkCrossStudentPlagiarism = async (newEssayId, text, studentId) =
       ...(studentId ? { student: { $exists: true, $ne: studentId } } : {}),
       status: { $in: ['submitted', 'reviewed'] }
     }).select('_id title content')
-    const otherEssays = await finalizeQuery(essaysQuery, 200)
+    const otherEssays = await finalizeQuery(essaysQuery, 200, { _id: -1 })
 
     if (!otherEssays?.length) {
       return { isPlagiarized: false, similarityScore: 0, matchedEssay: null, status: 'no_comparison_data', comparedEssayCount: 0 }

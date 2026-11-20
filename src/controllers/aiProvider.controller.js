@@ -1,10 +1,10 @@
-import AIProviderAccount from '../models/AIProviderAccount.js'
+import AIProviderAccount, { MAX_API_KEYS_PER_ACCOUNT } from '../models/AIProviderAccount.js'
 import AIProviderModel from '../models/AIProviderModel.js'
 import AIModelCombo from '../models/AIModelCombo.js'
 import Config from '../models/Config.js'
 import asyncHandler from '../utils/asyncHandler.js'
 import ErrorResponse from '../utils/ErrorResponse.js'
-import { encryptSecret, maskSecret } from '../utils/secretCrypto.js'
+import { decryptSecret, encryptSecret, maskSecret } from '../utils/secretCrypto.js'
 import { testAIProviderAccount } from '../services/aiGateway.service.js'
 import { AI_ROUTES } from '../constants/aiRoutes.js'
 import { fetchSafeUrl, validateSafeUrl } from '../utils/ssrfValidator.js'
@@ -47,6 +47,117 @@ const parsePricing = (input, output) => {
   }
   return { inputCostPerMillionUsd, outputCostPerMillionUsd }
 }
+const LEGACY_KEY_ID = 'legacy'
+const KEY_HEALTH_FIELDS = ['cooldownUntil', 'needsAttention', 'consecutiveFailures', 'lastUsedAt', 'lastErrorCode', 'lastErrorAt']
+
+const publicKey = (key) => ({
+  _id: key._id,
+  label: key.label || '',
+  maskedKey: key.maskedKey || '••••••••',
+  enabled: key.enabled !== false,
+  cooldownUntil: key.cooldownUntil || null,
+  needsAttention: Boolean(key.needsAttention),
+  consecutiveFailures: key.consecutiveFailures || 0,
+  lastUsedAt: key.lastUsedAt || null,
+  lastErrorCode: key.lastErrorCode || '',
+  lastErrorAt: key.lastErrorAt || null,
+})
+
+// Accounts created before multi-key support hold one key in encryptedApiKey and
+// track its health on the account. Show it as a single key with a stable id.
+const publicKeys = (account) => {
+  if (Array.isArray(account.apiKeys) && account.apiKeys.length) return account.apiKeys.map(publicKey)
+  if (!account.encryptedApiKey) return []
+  return [publicKey({ _id: LEGACY_KEY_ID, label: 'Key 1', maskedKey: account.maskedKey, enabled: true, ...Object.fromEntries(KEY_HEALTH_FIELDS.map((field) => [field, account[field]])) })]
+}
+
+const maskStoredKey = (encryptedKey) => {
+  try {
+    return maskSecret(decryptSecret(encryptedKey))
+  } catch {
+    return '••••••••'
+  }
+}
+
+const cleanKeyLabel = (value) => clean(value, 60)
+
+// Moves a legacy single key into apiKeys so it can be managed like any other
+// key. Its health moves with it; the account keeps only provider-wide health.
+const ensureKeyList = (account) => {
+  if (account.apiKeys.length || !account.encryptedApiKey) return
+  account.apiKeys.push({
+    label: 'Key 1',
+    encryptedKey: account.encryptedApiKey,
+    maskedKey: maskStoredKey(account.encryptedApiKey),
+    enabled: true,
+    needsAttention: Boolean(account.needsAttention),
+    cooldownUntil: account.cooldownUntil || null,
+    consecutiveFailures: account.consecutiveFailures || 0,
+    lastUsedAt: account.lastUsedAt || null,
+    lastErrorCode: account.lastErrorCode || '',
+    lastErrorAt: account.lastErrorAt || null,
+  })
+  account.encryptedApiKey = undefined
+  account.needsAttention = false
+  account.cooldownUntil = null
+  account.consecutiveFailures = 0
+  account.lastErrorCode = ''
+}
+
+const findKey = (account, keyId) => {
+  if (keyId === LEGACY_KEY_ID) return account.apiKeys[0] || null
+  return account.apiKeys.find((key) => String(key._id) === String(keyId)) || null
+}
+
+// The account is flagged only when none of its enabled keys can still be used.
+const syncAccountAttention = (account) => {
+  const usable = account.apiKeys.some((key) => key.enabled !== false && !key.needsAttention)
+  if (usable) {
+    if (['ALL_KEYS_FAILED', 'NO_USABLE_KEY'].includes(account.lastErrorCode)) account.lastErrorCode = ''
+    account.needsAttention = false
+    return
+  }
+  account.needsAttention = true
+  account.lastErrorCode = account.apiKeys.some((key) => key.enabled !== false) ? 'ALL_KEYS_FAILED' : 'NO_USABLE_KEY'
+  account.lastErrorAt = new Date()
+}
+
+const resetKeyHealth = (key) => {
+  key.needsAttention = false
+  key.cooldownUntil = null
+  key.consecutiveFailures = 0
+  key.lastErrorCode = ''
+  key.lastErrorAt = null
+}
+
+const decryptedKeys = (account) => account.apiKeys.flatMap((key) => {
+  try {
+    return [decryptSecret(key.encryptedKey)]
+  } catch {
+    return []
+  }
+})
+
+// Accepts `apiKey` (one key) and/or `apiKeys` (strings or { apiKey, label }).
+const parseNewKeys = (apiKey, apiKeys) => {
+  const items = []
+  if (typeof apiKey === 'string' && clean(apiKey, 1000)) items.push({ key: clean(apiKey, 1000), label: '' })
+  if (apiKeys !== undefined) {
+    if (!Array.isArray(apiKeys)) throw new ErrorResponse('API keys must be a list', 400)
+    for (const item of apiKeys) {
+      const key = clean(typeof item === 'string' ? item : item?.apiKey, 1000)
+      if (key) items.push({ key, label: cleanKeyLabel(typeof item === 'string' ? '' : item?.label) })
+    }
+  }
+  const unique = [...new Map(items.map((item) => [item.key, item])).values()]
+  if (unique.length > MAX_API_KEYS_PER_ACCOUNT) {
+    throw new ErrorResponse(`An AI provider account can hold at most ${MAX_API_KEYS_PER_ACCOUNT} API keys`, 400)
+  }
+  return unique
+}
+
+const isAuthFailure = (error) => error?.code === 'AUTH_FAILED' || [401, 403].includes(Number(error?.status || error?.statusCode))
+
 const publicAccount = (account) => ({
   _id: account._id,
   name: account.name,
@@ -58,8 +169,10 @@ const publicAccount = (account) => ({
   enabled: account.enabled,
   priority: account.priority,
   routes: account.routes || [],
-  isConfigured: Boolean(account.encryptedApiKey),
-  maskedKey: account.maskedKey || '••••••••',
+  isConfigured: publicKeys(account).length > 0,
+  maskedKey: publicKeys(account)[0]?.maskedKey || '••••••••',
+  apiKeys: publicKeys(account),
+  keyCount: publicKeys(account).length,
   cooldownUntil: account.cooldownUntil,
   needsAttention: Boolean(account.needsAttention),
   consecutiveFailures: account.consecutiveFailures,
@@ -80,16 +193,20 @@ const publicModel = (model) => ({
 
 export const listAIProviders = asyncHandler(async (req, res) => {
   const accounts = await AIProviderAccount.find().select('+encryptedApiKey').sort({ priority: 1, name: 1 }).lean()
-  res.json({ success: true, data: accounts.map(publicAccount) })
+  res.json({ success: true, data: accounts.map((account) => publicAccount({
+    ...account,
+    maskedKey: account.encryptedApiKey ? maskStoredKey(account.encryptedApiKey) : undefined,
+  })) })
 })
 
 export const createAIProvider = asyncHandler(async (req, res) => {
-  const { name, provider, model, models, apiKey, baseUrl, priority, routes, enabled, inputCostPerMillionUsd, outputCostPerMillionUsd } = req.body || {}
+  const { name, provider, model, models, apiKey, apiKeys, baseUrl, priority, routes, enabled, inputCostPerMillionUsd, outputCostPerMillionUsd } = req.body || {}
+  const newKeys = parseNewKeys(apiKey, apiKeys)
   const selectedModels = Array.isArray(models)
     ? models.slice(0, 100).map((item) => ({ modelId: clean(item?.modelId, 160), displayName: clean(item?.displayName, 160) })).filter((item) => item.modelId)
     : []
   const primaryModel = clean(model, 160) || selectedModels[0]?.modelId
-  if (!clean(name, 100) || !PROVIDERS.has(provider) || !primaryModel || !clean(apiKey, 1000)) {
+  if (!clean(name, 100) || !PROVIDERS.has(provider) || !primaryModel || !newKeys.length) {
     throw new ErrorResponse('Provider name, type, at least one model and API key are required', 400)
   }
   if (!selectedModels.some((item) => item.modelId === primaryModel)) selectedModels.unshift({ modelId: primaryModel, displayName: primaryModel })
@@ -104,7 +221,11 @@ export const createAIProvider = asyncHandler(async (req, res) => {
     model: primaryModel,
     ...pricing,
     baseUrl: clean(baseUrl, 300),
-    encryptedApiKey: encryptSecret(apiKey),
+    apiKeys: newKeys.map((item, index) => ({
+      label: item.label || `Key ${index + 1}`,
+      encryptedKey: encryptSecret(item.key),
+      maskedKey: maskSecret(item.key),
+    })),
     priority: Number.isInteger(priority) ? Math.min(1000, Math.max(0, priority)) : 100,
     routes: validatedRoutes(routes).slice(0, 30),
     enabled: enabled !== false,
@@ -125,7 +246,6 @@ export const createAIProvider = asyncHandler(async (req, res) => {
   await logAction(req.user?._id, 'ADMIN_CREATE_AI_PROVIDER', 'AIProviderAccount', account._id, { name: account.name, provider: account.provider })
   res.status(201).json({ success: true, data: {
     ...publicAccount(account.toObject()),
-    maskedKey: maskSecret(apiKey),
     defaultModel: publicModel(createdModels.find((item) => item.modelId === primaryModel).toObject()),
     models: createdModels.map((item) => publicModel(item.toObject())),
   } })
@@ -181,7 +301,7 @@ export const discoverAIProviderModels = asyncHandler(async (req, res) => {
 })
 
 export const updateAIProvider = asyncHandler(async (req, res) => {
-  const account = await AIProviderAccount.findById(req.params.id).select('+encryptedApiKey')
+  const account = await AIProviderAccount.findById(req.params.id).select('+encryptedApiKey +apiKeys.encryptedKey')
   if (!account) throw new ErrorResponse('AI provider account not found', 404)
   const { name, model, apiKey, baseUrl, priority, routes, enabled, inputCostPerMillionUsd, outputCostPerMillionUsd } = req.body || {}
 
@@ -212,11 +332,21 @@ export const updateAIProvider = asyncHandler(async (req, res) => {
   }
   if (apiKey !== undefined && typeof apiKey !== 'string') throw new ErrorResponse('API key must be a string', 400)
   if (apiKey && !apiKey.includes('••••')) {
-    account.encryptedApiKey = encryptSecret(apiKey)
+    // Backward compatible single-key edit: replaces the first key.
+    ensureKeyList(account)
+    const plaintext = clean(apiKey, 1000)
+    if (!account.apiKeys.length) {
+      account.apiKeys.push({ label: 'Key 1', encryptedKey: encryptSecret(plaintext), maskedKey: maskSecret(plaintext) })
+    } else {
+      account.apiKeys[0].encryptedKey = encryptSecret(plaintext)
+      account.apiKeys[0].maskedKey = maskSecret(plaintext)
+      resetKeyHealth(account.apiKeys[0])
+    }
     account.needsAttention = false
     account.consecutiveFailures = 0
     account.lastErrorCode = ''
     account.cooldownUntil = null
+    syncAccountAttention(account)
   }
   if (Number.isInteger(priority)) account.priority = Math.min(1000, Math.max(0, priority))
   if (routes !== undefined) {
@@ -226,7 +356,7 @@ export const updateAIProvider = asyncHandler(async (req, res) => {
   if (enabled !== undefined) account.enabled = Boolean(enabled)
   await account.save()
   await logAction(req.user?._id, 'ADMIN_UPDATE_AI_PROVIDER', 'AIProviderAccount', account._id, { name: account.name, provider: account.provider })
-  res.json({ success: true, data: publicAccount({ ...account.toObject(), maskedKey: account.maskedKey || '••••••••' }) })
+  res.json({ success: true, data: publicAccount(account.toObject()) })
 })
 
 export const deleteAIProvider = asyncHandler(async (req, res) => {
@@ -423,22 +553,149 @@ export const activateAICombo = asyncHandler(async (req, res) => {
   res.json({ success: true, data: publicCombo(activated) })
 })
 
-export const testAIProvider = asyncHandler(async (req, res) => {
-  const account = await AIProviderAccount.findById(req.params.id).select('+encryptedApiKey')
-  if (!account) throw new ErrorResponse('AI provider account not found', 404)
+async function testOneKey(account, key) {
   const started = Date.now()
   try {
-    const result = await testAIProviderAccount(account)
-    await AIProviderAccount.updateOne(
-      { _id: account._id },
-      { $set: { lastUsedAt: new Date(), consecutiveFailures: 0, lastErrorCode: '', needsAttention: false }, $unset: { cooldownUntil: 1 } },
-    )
-    res.json({ success: true, data: { ...result, latencyMs: Date.now() - started } })
+    const result = await testAIProviderAccount(account, { encryptedKey: key.encryptedKey })
+    resetKeyHealth(key)
+    key.lastUsedAt = new Date()
+    return { keyId: key._id, label: key.label, ok: true, latencyMs: Date.now() - started, provider: result.provider, model: result.model }
   } catch (error) {
-    await AIProviderAccount.updateOne(
-      { _id: account._id },
-      { $set: { lastErrorCode: String(error.code || `HTTP_${error.status || 502}`).slice(0, 80), lastErrorAt: new Date(), ...([401, 403].includes(error.status) ? { needsAttention: true } : {}) }, $inc: { consecutiveFailures: 1 } },
-    )
-    throw error
+    key.consecutiveFailures = (key.consecutiveFailures || 0) + 1
+    key.lastErrorCode = String(error.code || `HTTP_${error.status || 502}`).slice(0, 80)
+    key.lastErrorAt = new Date()
+    if (isAuthFailure(error)) key.needsAttention = true
+    return { keyId: key._id, label: key.label, ok: false, latencyMs: Date.now() - started, code: key.lastErrorCode, error }
   }
+}
+
+const publicTestResult = (result) => {
+  const copy = { ...result }
+  delete copy.error
+  return copy
+}
+
+export const testAIProvider = asyncHandler(async (req, res) => {
+  const account = await AIProviderAccount.findById(req.params.id).select('+encryptedApiKey +apiKeys.encryptedKey')
+  if (!account) throw new ErrorResponse('AI provider account not found', 404)
+  const started = Date.now()
+  if (!account.apiKeys.length) {
+    try {
+      const result = await testAIProviderAccount(account)
+      await AIProviderAccount.updateOne(
+        { _id: account._id },
+        { $set: { lastUsedAt: new Date(), consecutiveFailures: 0, lastErrorCode: '', needsAttention: false }, $unset: { cooldownUntil: 1 } },
+      )
+      res.json({ success: true, data: { ...result, latencyMs: Date.now() - started } })
+    } catch (error) {
+      await AIProviderAccount.updateOne(
+        { _id: account._id },
+        { $set: { lastErrorCode: String(error.code || `HTTP_${error.status || 502}`).slice(0, 80), lastErrorAt: new Date(), ...(isAuthFailure(error) ? { needsAttention: true } : {}) }, $inc: { consecutiveFailures: 1 } },
+      )
+      throw error
+    }
+    return
+  }
+  const keys = account.apiKeys.filter((key) => key.enabled !== false)
+  if (!keys.length) throw new ErrorResponse('This provider has no enabled API key to test', 400)
+  // Keys are independent, so they are tested in parallel; each one's health is updated.
+  const results = await Promise.all(keys.map((key) => testOneKey(account, key)))
+  const passed = results.filter((result) => result.ok)
+  if (passed.length) {
+    account.cooldownUntil = null
+    account.consecutiveFailures = 0
+    account.lastUsedAt = new Date()
+  }
+  syncAccountAttention(account)
+  await account.save()
+  if (!passed.length) {
+    const failure = results[0].error
+    failure.keyResults = results.map(publicTestResult)
+    throw failure
+  }
+  res.json({ success: true, data: {
+    provider: passed[0].provider,
+    model: passed[0].model,
+    latencyMs: Math.min(...passed.map((result) => result.latencyMs)),
+    keysPassed: passed.length,
+    keysTested: results.length,
+    keyResults: results.map(publicTestResult),
+    account: publicAccount(account.toObject()),
+  } })
+})
+
+const loadAccountForKeys = async (id) => {
+  const account = await AIProviderAccount.findById(id).select('+encryptedApiKey +apiKeys.encryptedKey')
+  if (!account) throw new ErrorResponse('AI provider account not found', 404)
+  ensureKeyList(account)
+  return account
+}
+
+export const addAIProviderKey = asyncHandler(async (req, res) => {
+  const account = await loadAccountForKeys(req.params.id)
+  const plaintext = clean(req.body?.apiKey, 1000)
+  if (!plaintext) throw new ErrorResponse('API key is required', 400)
+  if (account.apiKeys.length >= MAX_API_KEYS_PER_ACCOUNT) {
+    throw new ErrorResponse(`An AI provider account can hold at most ${MAX_API_KEYS_PER_ACCOUNT} API keys`, 400)
+  }
+  if (decryptedKeys(account).includes(plaintext)) throw new ErrorResponse('This API key is already saved for this provider', 409)
+  account.apiKeys.push({
+    label: cleanKeyLabel(req.body?.label) || `Key ${account.apiKeys.length + 1}`,
+    encryptedKey: encryptSecret(plaintext),
+    maskedKey: maskSecret(plaintext),
+  })
+  syncAccountAttention(account)
+  await account.save()
+  await logAction(req.user?._id, 'ADMIN_ADD_AI_PROVIDER_KEY', 'AIProviderAccount', account._id, { name: account.name, keyCount: account.apiKeys.length })
+  res.status(201).json({ success: true, data: publicAccount(account.toObject()) })
+})
+
+export const updateAIProviderKey = asyncHandler(async (req, res) => {
+  const account = await loadAccountForKeys(req.params.id)
+  const key = findKey(account, req.params.keyId)
+  if (!key) throw new ErrorResponse('API key not found', 404)
+  const { label, enabled, apiKey } = req.body || {}
+  if (label !== undefined) key.label = cleanKeyLabel(label) || key.label
+  if (enabled !== undefined) key.enabled = Boolean(enabled)
+  if (apiKey !== undefined) {
+    const plaintext = clean(apiKey, 1000)
+    if (!plaintext) throw new ErrorResponse('API key must not be empty', 400)
+    const others = account.apiKeys.filter((item) => item !== key)
+    if (decryptedKeys({ apiKeys: others }).includes(plaintext)) throw new ErrorResponse('This API key is already saved for this provider', 409)
+    key.encryptedKey = encryptSecret(plaintext)
+    key.maskedKey = maskSecret(plaintext)
+    resetKeyHealth(key)
+  }
+  syncAccountAttention(account)
+  await account.save()
+  await logAction(req.user?._id, 'ADMIN_UPDATE_AI_PROVIDER_KEY', 'AIProviderAccount', account._id, { name: account.name, keyId: String(key._id), enabled: key.enabled, replaced: apiKey !== undefined })
+  res.json({ success: true, data: publicAccount(account.toObject()) })
+})
+
+export const deleteAIProviderKey = asyncHandler(async (req, res) => {
+  const account = await loadAccountForKeys(req.params.id)
+  const key = findKey(account, req.params.keyId)
+  if (!key) throw new ErrorResponse('API key not found', 404)
+  if (account.apiKeys.length <= 1) {
+    throw new ErrorResponse('A provider needs at least one API key. Add another key first, or remove the provider.', 400)
+  }
+  account.apiKeys.pull(key._id)
+  syncAccountAttention(account)
+  await account.save()
+  await logAction(req.user?._id, 'ADMIN_DELETE_AI_PROVIDER_KEY', 'AIProviderAccount', account._id, { name: account.name, keyCount: account.apiKeys.length })
+  res.json({ success: true, data: publicAccount(account.toObject()) })
+})
+
+export const testAIProviderKey = asyncHandler(async (req, res) => {
+  const account = await loadAccountForKeys(req.params.id)
+  const key = findKey(account, req.params.keyId)
+  if (!key) throw new ErrorResponse('API key not found', 404)
+  const result = await testOneKey(account, key)
+  syncAccountAttention(account)
+  await account.save()
+  if (!result.ok) {
+    result.error.keyResults = [publicTestResult(result)]
+    throw result.error
+  }
+  res.json({ success: true, data: { ...publicTestResult(result), account: publicAccount(account.toObject()) } })
 })

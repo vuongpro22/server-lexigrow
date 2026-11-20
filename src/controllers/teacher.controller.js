@@ -8,7 +8,7 @@ import Alert from '../models/Alert.js'
 import ErrorResponse from '../utils/ErrorResponse.js'
 import asyncHandler from '../utils/asyncHandler.js'
 import { classifyStudents, classifyStudentStatus } from '../services/studentStatus.service.js'
-import { classifyGrammarErrorText, DEFAULT_GRAMMAR_CATEGORY, GRAMMAR_CATEGORIES } from '../utils/grammarCategory.js'
+import { classifyGrammarSuggestion, DEFAULT_GRAMMAR_CATEGORY, GRAMMAR_CATEGORIES } from '../utils/grammarCategory.js'
 import { buildTeacherEssayScopeFromClassIds } from '../utils/essayAccess.js'
 
 /**
@@ -510,7 +510,7 @@ export const getClassInsights = asyncHandler(async (req, res) => {
       analysis.suggestions.forEach(sug => {
         if (sug.type === 'improvement') {
           const text = sug.text
-          const category = classifyGrammarErrorText(text)
+          const category = classifyGrammarSuggestion(sug)
           grammarErrorsMap[category].count++
           grammarErrorsMap[category].examples.add(text)
         }

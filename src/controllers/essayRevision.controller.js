@@ -253,7 +253,7 @@ async function startRevisionEssayAnalysis(revisionId, studentId, language, quota
     }).catch(async (err) => {
       await Essay.updateOne(
         { _id: essay._id, revisionCounter: revision.revisionNumber },
-        { $set: { aiAnalysisStatus: 'failed', aiAnalysisRevision: revision.revisionNumber } },
+        { $set: { aiAnalysisStatus: 'failed', aiAnalysisRevision: revision.revisionNumber, aiAnalysisProcessingUntil: null } },
       ).catch((statusErr) => console.error('[Revision AI Analysis] Could not persist failed grading state:', statusErr.message))
       await settleDailyEssayQuota({ student: studentId, requestId: quotaMeta.requestId, day: quotaMeta.day, outcome: 'release' })
         .catch((quotaErr) => console.error('[Revision AI Analysis] Quota release failed:', quotaErr.message))
