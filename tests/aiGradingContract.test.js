@@ -243,6 +243,8 @@ describe('CEFR distribution', () => {
     expect(result.c1).toBeCloseTo(33.3)
     expect(result.awl).toBe(0)
     expect(result.advancedPercentage).toBeCloseTo(66.7)
+    expect(result.matchedWords).toBe(3)
+    expect(result.coverage).toBe(100)
     expect(result.a1 + result.a2 + result.b1 + result.b2 + result.c1 + result.c2 + result.awl).toBeLessThanOrEqual(100)
 
     const awlOnly = await calculateCefrDistribution('alpha beta gamma', [
@@ -254,6 +256,18 @@ describe('CEFR distribution', () => {
     expect(awlOnly.awl).toBeCloseTo(33.3)
     expect(awlOnly.a1 + awlOnly.awl + awlOnly.b2).toBeCloseTo(99.9)
     expect(awlOnly.a1 + awlOnly.awl + awlOnly.b2).toBeLessThanOrEqual(100)
+  })
+})
+
+describe('CEFR distribution coverage', () => {
+  it('reports how many essay words the CEFR list matched', async () => {
+    const result = await calculateCefrDistribution('the people think technology changes school life', [
+      { word: 'school', cefr: 'A1', awl: false },
+      { word: 'technology', cefr: 'B1', awl: false },
+    ])
+    expect(result.uniqueWords).toBe(7)
+    expect(result.matchedWords).toBe(2)
+    expect(result.coverage).toBeCloseTo(28.6)
   })
 })
 

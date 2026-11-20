@@ -186,7 +186,9 @@ export const getClassDetail = asyncHandler(async (req, res) => {
 
     // Status from canonical service
     const classification = statusMap.get(student._id.toString())
-    const status = classification?.status ?? 'stagnating'
+    // A student who has not submitted anything yet has no trend at all; showing
+    // the service's cautious 'stagnating' fallback would mislabel them.
+    const status = essays.length === 0 ? 'new' : (classification?.status ?? 'stagnating')
 
     return {
       _id:    student._id,
@@ -769,25 +771,43 @@ export const getAdminUsers = asyncHandler(async (req, res) => {
  */
 export const joinClassByCode = asyncHandler(async (req, res) => {
   const { code } = req.body
-  if (!code) {
-    throw new ErrorResponse('Please provide a class code', 400)
+  if (!code || typeof code !== 'string' || !code.trim()) {
+    throw new ErrorResponse('Vui lòng nhập mã lớp.', 400)
   }
 
   const cls = await Class.findOne({ code: code.toUpperCase().trim() })
   if (!cls) {
-    throw new ErrorResponse('Class not found with this code', 404)
+    throw new ErrorResponse('Không tìm thấy lớp với mã này.', 404)
+  }
+  if (cls.status === 'archived') {
+    throw new ErrorResponse('Lớp này đã được lưu trữ, không nhận thêm học sinh.', 400)
   }
 
   // Check if student is already enrolled
   const isEnrolled = cls.students.some(s => s.toString() === req.user._id.toString())
   if (isEnrolled) {
-    throw new ErrorResponse('You are already enrolled in this class', 400)
+    throw new ErrorResponse('Bạn đã là thành viên của lớp này.', 400)
   }
 
   // Check if request is already pending
   const isPending = cls.pendingStudents?.some(s => s.toString() === req.user._id.toString())
   if (isPending) {
-    throw new ErrorResponse('Your request to join this class is already pending approval', 400)
+    throw new ErrorResponse('Yêu cầu vào lớp của bạn đang chờ giáo viên duyệt.', 400)
+  }
+
+  // Reject up front when the teacher's plan has no free slot. Otherwise the
+  // request sits in the pending list forever because approval would fail.
+  try {
+    await assertStudentCapacity(cls, [req.user._id])
+  } catch (err) {
+    if (err?.statusCode === 403) {
+      throw new ErrorResponse(
+        'Lớp này hiện đã đủ số học sinh theo gói của giáo viên. Vui lòng liên hệ giáo viên.',
+        403,
+        'CLASS_CAPACITY_REACHED',
+      )
+    }
+    throw err
   }
 
   await Class.updateOne({ _id: cls._id }, { $addToSet: { pendingStudents: req.user._id } })
@@ -798,14 +818,14 @@ export const joinClassByCode = asyncHandler(async (req, res) => {
     recipient: cls.teacher,
     sender: req.user._id,
     type: 'system',
-    title: 'New Class Join Request',
-    message: `${req.user.name} requested to join your class "${cls.name}".`,
+    title: 'Yêu cầu vào lớp mới',
+    message: `${req.user.name} muốn tham gia lớp "${cls.name}".`,
     link: `/teacher/class/${cls._id}`
   })
 
   res.status(200).json({
     success: true,
-    message: 'Join request sent successfully! Waiting for teacher approval.'
+    message: 'Đã gửi yêu cầu vào lớp. Vui lòng chờ giáo viên duyệt.'
   })
 })
 
@@ -869,8 +889,8 @@ export const handleJoinRequest = asyncHandler(async (req, res) => {
       recipient: studentId,
       sender: req.user._id,
       type: 'system',
-      title: 'Join Request Approved',
-      message: 'You have been approved to join the class "' + cls.name + '".',
+      title: 'Yêu cầu vào lớp đã được duyệt',
+      message: 'Bạn đã được duyệt vào lớp "' + cls.name + '".',
       link: '/student/class/' + cls._id,
     })
   } else {
@@ -879,14 +899,14 @@ export const handleJoinRequest = asyncHandler(async (req, res) => {
       recipient: studentId,
       sender: req.user._id,
       type: 'system',
-      title: 'Join Request Rejected',
-      message: 'Your request to join the class "' + cls.name + '" was declined.',
+      title: 'Yêu cầu vào lớp bị từ chối',
+      message: 'Yêu cầu tham gia lớp "' + cls.name + '" của bạn đã bị từ chối.',
       link: '/student/class',
     })
   }
 
   res.status(200).json({
     success: true,
-    message: 'Successfully ' + (action === 'approve' ? 'approved' : 'rejected') + ' student join request.',
+    message: action === 'approve' ? 'Đã duyệt yêu cầu vào lớp.' : 'Đã từ chối yêu cầu vào lớp.',
   })
 })

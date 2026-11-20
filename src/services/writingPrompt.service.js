@@ -29,8 +29,8 @@ import {
 } from './aiGuardrails.service.js'
 
 // =================== CONFIG ===================
-const DEFAULT_WORD_COUNT_MIN = 60
-const DEFAULT_WORD_COUNT_MAX = 100
+const DEFAULT_WORD_COUNT_MIN = 150
+const DEFAULT_WORD_COUNT_MAX = 300
 const PROMPT_CACHE_TTL = 3600 // 1 giờ (tránh gọi AI lặp cho cùng session)
 const RECENT_ESSAY_LIMIT = 20
 
@@ -112,14 +112,14 @@ Target vocabulary words the student MUST use in their writing (untrusted data): 
 
 Requirements:
 - The prompt must be 1-2 sentences, clear and specific
-- The student should write a short paragraph of 60-100 words
+- The student should write a standard essay of 150-300 words
 - The prompt must naturally require using ALL of the target words
 - Appropriate for ${safeLevel} (CEFR) — use simple, concrete language
 - Avoid abstract philosophical topics for A2/B1 levels${exclusionBlock}
 
 Return a JSON object:
 {
-  "prompt": "Write a short paragraph about ..."
+  "prompt": "Write an essay (150-300 words) about ..."
 }
 
 Return ONLY valid JSON, no markdown.`
@@ -190,24 +190,24 @@ function buildFallbackPrompt(theme, targetWords, level) {
 
   // Base templates cho mọi level
   const baseTemplates = [
-    `Write a short paragraph (60-100 words) about "${theme}". Try to naturally use these words in your writing: ${wordList}.`,
-    `Describe your experience or thoughts about "${theme}" in 60-100 words. Make sure to include these words: ${wordList}.`,
-    `Write a short paragraph (60-100 words) explaining the importance of "${theme}" in your daily life. Use the following words: ${wordList}.`,
+    `Write an essay (150-300 words) about "${theme}". Try to naturally use these words in your writing: ${wordList}.`,
+    `Describe your experience or thoughts about "${theme}" in an essay of 150-300 words. Make sure to include these words: ${wordList}.`,
+    `Write an essay (150-300 words) explaining the importance of "${theme}" in your daily life. Use the following words: ${wordList}.`,
   ]
 
   // Level-specific templates
   const levelTemplates = {
     A2: [
-      `Write a simple paragraph (60-80 words) about "${theme}". Try to use these words: ${wordList}.`,
-      `Describe "${theme}" in 5-7 simple sentences. Include these words: ${wordList}.`,
+      `Write a clear essay (150-200 words) about "${theme}". Try to use these words: ${wordList}.`,
+      `Describe "${theme}" in a short essay (150-200 words). Include these words: ${wordList}.`,
     ],
     B1: [], // dùng base
     B2: [
-      `Write a paragraph (80-100 words) discussing "${theme}" and share your perspective. Use these words naturally: ${wordList}.`,
+      `Write an essay (200-300 words) discussing "${theme}" and share your perspective. Use these words naturally: ${wordList}.`,
     ],
     C1: [
-      `Compose a reflective paragraph (80-120 words) on "${theme}", incorporating the following advanced vocabulary: ${wordList}.`,
-      `Write an insightful paragraph (100-150 words) analyzing "${theme}". Weave in these words: ${wordList}.`,
+      `Compose a reflective essay (250-300 words) on "${theme}", incorporating the following advanced vocabulary: ${wordList}.`,
+      `Write an insightful essay (250-300 words) analyzing "${theme}". Weave in these words: ${wordList}.`,
     ],
   }
 

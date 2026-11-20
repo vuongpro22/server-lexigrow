@@ -168,6 +168,44 @@ describe('Parent purchases a plan for a linked child', () => {
     expect(PaymentTransaction.create).not.toHaveBeenCalled()
   })
 
+  it('rejects a student buying a plan lower than their own tier', async () => {
+    getUserEffectiveTier.mockResolvedValue({ tier: 'pro', source: 'personal_subscription' })
+    const student = { ...child, _id: '507f1f77bcf86cd799439012' }
+    const next = vi.fn()
+
+    await createPayment({ user: student, params: {}, body: { planSlug: 'student-plus' } }, response(), next)
+
+    expect(next).toHaveBeenCalledOnce()
+    expect(next.mock.calls[0][0].code).toBe('PLAN_NOT_AN_UPGRADE')
+    expect(next.mock.calls[0][0].message).toBe('Gói này thấp hơn gói bạn đang sử dụng.')
+    expect(PaymentTransaction.create).not.toHaveBeenCalled()
+  })
+
+  it('rejects a teacher buying a plan lower than their own tier', async () => {
+    getUserEffectiveTier.mockResolvedValue({ tier: 'pro', source: 'personal_subscription' })
+    SubscriptionPlan.findOne.mockResolvedValue({ ...plan, slug: 'teacher-plus', targetRole: 'teacher' })
+    const teacher = { _id: '507f1f77bcf86cd799439013', name: 'T', email: 't@example.com', role: 'teacher' }
+    const next = vi.fn()
+
+    await createPayment({ user: teacher, params: {}, body: { planSlug: 'teacher-plus' } }, response(), next)
+
+    expect(next).toHaveBeenCalledOnce()
+    expect(next.mock.calls[0][0].code).toBe('PLAN_NOT_AN_UPGRADE')
+    expect(PaymentTransaction.create).not.toHaveBeenCalled()
+  })
+
+  it('lets a student renew the same tier they already pay for', async () => {
+    getUserEffectiveTier.mockResolvedValue({ tier: 'plus', source: 'personal_subscription' })
+    const student = { ...child, _id: '507f1f77bcf86cd799439012' }
+    const res = response()
+    const next = vi.fn()
+
+    await createPayment({ user: student, params: {}, body: { planSlug: 'student-plus' } }, res, next)
+
+    expect(next).not.toHaveBeenCalled()
+    expect(res.status).toHaveBeenCalledWith(200)
+  })
+
   it('returns the child current effective tier and active personal plans', async () => {
     User.findOne.mockReturnValue({ select: vi.fn().mockResolvedValue(child) })
     getUserEffectiveTier.mockResolvedValue({

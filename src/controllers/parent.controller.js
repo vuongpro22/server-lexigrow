@@ -440,8 +440,10 @@ export const getChildren = asyncHandler(async (req, res) => {
   const children = await Promise.all(links.filter(link => link.student).map(async link => {
     const child = link.student
     const [wordsThisWeek, wordsLastWeek, masteredWordSet, latestEssays, activeAlerts, goals, childClass] = await Promise.all([
-      Vocabulary.countDocuments({ student: child._id, createdAt: { $gte: thisWeekStart, $lte: thisWeekEnd } }),
-      Vocabulary.countDocuments({ student: child._id, createdAt: { $gte: lastWeekStart, $lt: thisWeekStart } }),
+      // Same definition as the child progress page and the "New Words" goal:
+      // a word counts once it was reviewed or used, not merely saved.
+      countLearnedWords(child._id, thisWeekStart, thisWeekEnd),
+      countLearnedWords(child._id, lastWeekStart, new Date(thisWeekStart.getTime() - 1)),
       getMasteredWords(child._id),
       Essay.find({
         student: child._id,

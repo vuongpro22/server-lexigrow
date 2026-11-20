@@ -124,8 +124,8 @@ async function run() {
         .join(', ')}`,
     )
     log(
-      r1.wordCountMin === 60 && r1.wordCountMax === 100,
-      'wordCount bounds = 60-100',
+      r1.wordCountMin === 150 && r1.wordCountMax === 300,
+      'wordCount bounds = 150-300',
     )
     log(r1.generatedAt instanceof Date, 'generatedAt là Date')
 

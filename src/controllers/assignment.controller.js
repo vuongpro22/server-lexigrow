@@ -13,10 +13,10 @@ import { createManyNotifications, createNotification } from '../services/notific
 const parseFutureDueDate = (value, allowPast = false) => {
   const dueDate = new Date(value)
   if (Number.isNaN(dueDate.getTime())) {
-    throw new ErrorResponse('Please provide a valid due date', 400)
+    throw new ErrorResponse('Vui lòng chọn hạn nộp hợp lệ.', 400)
   }
   if (!allowPast && dueDate <= new Date()) {
-    throw new ErrorResponse('Due date must be in the future', 400)
+    throw new ErrorResponse('Hạn nộp phải ở thời điểm trong tương lai.', 400)
   }
   return dueDate
 }
@@ -35,7 +35,7 @@ async function assertAssignmentClassAccess(assignment, teacherId, { write = fals
     throw new ErrorResponse('Not authorized', 403)
   }
   if (write && cls.status !== 'active') {
-    throw new ErrorResponse('Assignment is read-only while the class is not active', 409, 'CLASS_NOT_ACTIVE')
+    throw new ErrorResponse('Lớp chưa hoạt động nên bài tập chỉ được xem, không thể chỉnh sửa.', 409, 'CLASS_NOT_ACTIVE')
   }
   return cls
 }
@@ -50,7 +50,7 @@ export const createAssignment = asyncHandler(async (req, res) => {
   const validatedDueDate = parseFutureDueDate(dueDate)
 
   if (status !== undefined && !['active', 'closed'].includes(status)) {
-    throw new ErrorResponse('Invalid assignment status', 400)
+    throw new ErrorResponse('Trạng thái bài tập không hợp lệ.', 400)
   }
   const assignmentStatus = status || 'active'
 
@@ -58,10 +58,10 @@ export const createAssignment = asyncHandler(async (req, res) => {
   const cls = await Class.findById(classId)
   if (!cls) throw new ErrorResponse('Class not found', 404)
   if (cls.teacher.toString() !== req.user._id.toString()) {
-    throw new ErrorResponse('Not authorized to create assignments for this class', 403)
+    throw new ErrorResponse('Bạn không có quyền giao bài cho lớp này.', 403)
   }
   if (cls.status === 'archived') {
-    throw new ErrorResponse('Cannot create assignments for an archived class', 400)
+    throw new ErrorResponse('Không thể giao bài cho lớp đã lưu trữ.', 400)
   }
 
   const learningSetId = req.body.learningSetId === undefined ? null : await validateAssignmentLearningSet(req.body.learningSetId)
@@ -81,8 +81,8 @@ export const createAssignment = asyncHandler(async (req, res) => {
     const notifications = cls.students.map(studentId => ({
       recipient: studentId,
       sender: req.user._id,
-      title: 'New Assignment Assigned',
-      message: `Teacher ${req.user.name} has posted a new assignment: "${title}" in class "${cls.name}".`,
+      title: 'Bài tập mới',
+      message: `Giáo viên ${req.user.name} vừa giao bài "${title}" trong lớp "${cls.name}".`,
       type: 'assignment',
       link: `/student/class/${classId}`,
     }))
@@ -257,8 +257,8 @@ export const updateAssignment = asyncHandler(async (req, res) => {
     const notifications = cls.students.map(studentId => ({
       recipient: studentId,
       sender: req.user._id,
-      title: 'Assignment Updated',
-      message: `Teacher ${req.user.name} has updated the assignment: "${assignment.title}" in class "${cls.name}".`,
+      title: 'Bài tập đã được cập nhật',
+      message: `Giáo viên ${req.user.name} đã cập nhật bài "${assignment.title}" trong lớp "${cls.name}".`,
       type: 'assignment',
       link: `/student/class/${assignment.classId}`,
     }))
@@ -272,8 +272,8 @@ export const updateAssignment = asyncHandler(async (req, res) => {
   createNotification({
     recipient: req.user._id,
     sender: req.user._id,
-    title: 'Assignment Updated',
-    message: `Assignment "${assignment.title}" has been updated successfully.`,
+    title: 'Bài tập đã được cập nhật',
+    message: `Đã cập nhật bài tập "${assignment.title}".`,
     type: 'assignment',
     link: `/teacher/assignment/${assignment._id}`,
   }).catch(err => {

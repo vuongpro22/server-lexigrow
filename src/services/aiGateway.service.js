@@ -315,7 +315,7 @@ async function groqChat(account, { messages, model, responseFormat, temperature,
   return { text, usage: response.usage || null, providerRequestId: response.id }
 }
 
-async function openAICompatibleChat(account, { messages, model, responseFormat, temperature, maxTokens = 4096, timeoutMs = 30000, requestId }) {
+async function openAICompatibleChat(account, { messages, model, responseFormat, temperature, maxTokens = 4096, timeoutMs = 30000, requestId }, _attempt = 0) {
   const endpoint = (account.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '') + '/chat/completions'
   let response
   const controller = new AbortController()
@@ -326,7 +326,7 @@ async function openAICompatibleChat(account, { messages, model, responseFormat, 
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${account.apiKey}`,
-        ...(requestId ? { 'Idempotency-Key': requestId, 'X-Request-Id': requestId } : {}),
+        ...(requestId ? { 'Idempotency-Key': _attempt > 0 ? `${requestId}:r${_attempt}` : requestId, 'X-Request-Id': requestId } : {}),
       },
       body: JSON.stringify({
         messages,
@@ -350,11 +350,60 @@ async function openAICompatibleChat(account, { messages, model, responseFormat, 
     clearTimeout(timer)
   }
   if (!response.ok) {
-    try { await response.body?.cancel?.() } catch { /* response body is discarded */ }
-    throw new AIProviderError('OpenAI-compatible provider request failed', {
+    const errText = await response.text().catch(() => '')
+    let errData = null
+    try { errData = errText ? JSON.parse(errText) : null } catch { /* ignore non-JSON error body */ }
+    const errCode = String(errData?.error?.code || '')
+    const errMsg = String(errData?.error?.message || '')
+    const failedGen = errData?.error?.failed_generation
+
+    if (typeof failedGen === 'string' && failedGen.trim()) {
+      let candidateJson = failedGen.trim()
+      const fenceMatch = candidateJson.match(/```(?:json)?\s*([\s\S]*?)```/)
+      if (fenceMatch) candidateJson = fenceMatch[1].trim()
+      const braceStart = candidateJson.indexOf('{')
+      const braceEnd = candidateJson.lastIndexOf('}')
+      if (braceStart !== -1 && braceEnd > braceStart) {
+        const sliced = candidateJson.slice(braceStart, braceEnd + 1)
+        try {
+          JSON.parse(sliced)
+          return { text: sliced, usage: null, providerRequestId: null }
+        } catch { /* fall through to retry */ }
+      }
+    }
+
+    const isJsonValidateFailed = response.status === 400 && (
+      errCode === 'json_validate_failed' ||
+      /json_validate_failed|Failed to generate JSON|max_tokens|max_completion_tokens/i.test(`${errCode} ${errMsg}`)
+    )
+    const isRateLimited = response.status === 429 || /rate[_ -]?limit|tokens per minute|too many requests/i.test(`${errCode} ${errMsg}`)
+
+    if (_attempt < 2 && (isJsonValidateFailed || isRateLimited || response.status >= 500)) {
+      if (isRateLimited || response.status >= 500) {
+        const msgWaitMatch = errMsg.match(/try again in ([0-9.]+)s/i)
+        const msgWaitMs = msgWaitMatch ? Math.ceil(Number(msgWaitMatch[1]) * 1000) : 0
+        const waitMs = Math.min(Math.max(retryAfterMs(response) || msgWaitMs || 1800, 500), 4500)
+        await new Promise((resolve) => setTimeout(resolve, waitMs))
+      }
+      return openAICompatibleChat(
+        account,
+        {
+          messages,
+          model,
+          responseFormat: isJsonValidateFailed ? undefined : responseFormat,
+          temperature,
+          maxTokens: isJsonValidateFailed ? Math.min(maxTokens, 4096) : maxTokens,
+          timeoutMs,
+          requestId,
+        },
+        _attempt + 1,
+      )
+    }
+
+    throw new AIProviderError(errMsg ? `OpenAI-compatible provider request failed: ${errMsg}` : 'OpenAI-compatible provider request failed', {
       status: response.status,
-      code: response.status === 429 ? 'RATE_LIMITED' : 'AI_REQUEST_ERROR',
-      retryable: response.status === 429 || response.status >= 500,
+      code: isRateLimited ? 'RATE_LIMITED' : 'AI_REQUEST_ERROR',
+      retryable: isRateLimited || isJsonValidateFailed || response.status >= 500,
       retryAfterMs: retryAfterMs(response),
     })
   }

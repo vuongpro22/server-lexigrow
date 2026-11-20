@@ -182,11 +182,44 @@ describe('Class Analytics & Access API', () => {
       .expect(200)
 
     expect(res.body.success).toBe(true)
-    expect(res.body.message).toContain('Join request sent successfully')
+    expect(res.body.message).toContain('Đã gửi yêu cầu vào lớp')
     expect(Class.updateOne).toHaveBeenCalledWith(
       { _id: 'cccccccccccccccccccccccc' },
       { $addToSet: { pendingStudents: 'bbbbbbbbbbbbbbbbbbbbbbbb' } },
     )
+  })
+
+  it('rejects a join request up front when the teacher has no free student slot', async () => {
+    const { assertStudentCapacity } = await import('../src/services/studentQuota.service.js')
+    const { default: ErrorResponse } = await import('../src/utils/ErrorResponse.js')
+    Class.updateOne.mockClear()
+    assertStudentCapacity.mockRejectedValueOnce(new ErrorResponse('Gói hiện tại cho phép tối đa 0 học sinh', 403))
+    Class.findOne.mockResolvedValue({
+      _id: 'cccccccccccccccccccccccc',
+      name: 'Free Class',
+      teacher: 'aaaaaaaaaaaaaaaaaaaaaaaa',
+      status: 'active',
+      students: [],
+      pendingStudents: [],
+    })
+
+    const res = await request(app)
+      .post('/api/classes/join')
+      .send({ code: 'FREE01' })
+      .expect(403)
+
+    expect(res.body.code).toBe('CLASS_CAPACITY_REACHED')
+    expect(Class.updateOne).not.toHaveBeenCalled()
+  })
+
+  it('rejects joining an archived class', async () => {
+    Class.updateOne.mockClear()
+    Class.findOne.mockResolvedValue({
+      _id: 'cccccccccccccccccccccccc', name: 'Old', teacher: 'aaaaaaaaaaaaaaaaaaaaaaaa',
+      status: 'archived', students: [], pendingStudents: [],
+    })
+    await request(app).post('/api/classes/join').send({ code: 'OLD001' }).expect(400)
+    expect(Class.updateOne).not.toHaveBeenCalled()
   })
 
   it('should allow teacher to approve a pending student request', async () => {
@@ -206,7 +239,7 @@ describe('Class Analytics & Access API', () => {
       .expect(200)
 
     expect(res.body.success).toBe(true)
-    expect(res.body.message).toContain('approved')
+    expect(res.body.message).toContain('Đã duyệt')
     expect(mockSave).toHaveBeenCalled()
   })
 })

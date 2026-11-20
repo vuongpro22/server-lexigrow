@@ -75,19 +75,19 @@ export const register = asyncHandler(async (req, res) => {
   const name = rawName.trim()
   // Reject before any query, pending-record deletion, hashing or OTP delivery.
   if (!name || name.length > MAX_NAME_LENGTH) {
-    throw new ErrorResponse('Name must contain between 1 and 100 characters', 400)
+    throw new ErrorResponse('Họ tên phải có từ 1 đến 100 ký tự.', 400)
   }
   if (!EMAIL_PATTERN.test(email)) {
-    throw new ErrorResponse('Please provide a valid email address', 400)
+    throw new ErrorResponse('Vui lòng nhập địa chỉ email hợp lệ.', 400)
   }
   if (password.length < MIN_PASSWORD_LENGTH) {
-    throw new ErrorResponse('Password must be at least 6 characters', 400)
+    throw new ErrorResponse('Mật khẩu phải có ít nhất 6 ký tự.', 400)
   }
 
   // Check if user exists in final DB
   const existingUser = await User.findOne({ email })
   if (existingUser) {
-    throw new ErrorResponse('Email already registered', 400)
+    throw new ErrorResponse('Email này đã được đăng ký.', 400)
   }
 
   // Only expired registrations may be replaced. The unique email index also
@@ -173,22 +173,22 @@ export const login = asyncHandler(async (req, res) => {
   // { "email": { "$ne": null }, "password": "x" } would otherwise reach
   // findOne and match an arbitrary account, admin included.
   if (!email || !password) {
-    throw new ErrorResponse('Please provide email and password', 400)
+    throw new ErrorResponse('Vui lòng nhập email và mật khẩu.', 400)
   }
   if (typeof email !== 'string' || typeof password !== 'string') {
-    throw new ErrorResponse('Please provide email and password', 400)
+    throw new ErrorResponse('Vui lòng nhập email và mật khẩu.', 400)
   }
 
   // Check user (include password for comparison)
   const user = await User.findOne({ email }).select('+password')
   if (!user) {
-    throw new ErrorResponse('Invalid email or password', 401)
+    throw new ErrorResponse('Email hoặc mật khẩu không đúng.', 401)
   }
 
   // Check password
   const isMatch = await user.matchPassword(password)
   if (!isMatch) {
-    throw new ErrorResponse('Invalid email or password', 401)
+    throw new ErrorResponse('Email hoặc mật khẩu không đúng.', 401)
   }
 
   // Check if verified
@@ -207,7 +207,7 @@ export const login = asyncHandler(async (req, res) => {
     throw new ErrorResponse('Đơn đăng ký của bạn đã bị từ chối. Vui lòng liên hệ Admin để biết thêm thông tin.', 403)
   }
   if (user.accountStatus === 'deleted') {
-    throw new ErrorResponse('Account has been deleted', 403)
+    throw new ErrorResponse('Tài khoản đã bị xoá.', 403)
   }
   await sendTokenResponse(user, 200, res)
 })
@@ -261,14 +261,14 @@ export const googleAuth = asyncHandler(async (req, res) => {
   const { code, role } = req.body
 
   if (!code) {
-    throw new ErrorResponse('Google authorization code is required', 400)
+    throw new ErrorResponse('Thiếu mã xác thực Google.', 400)
   }
 
   const clientId = process.env.GOOGLE_CLIENT_ID
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET
 
   if (!clientId || !clientSecret) {
-    throw new ErrorResponse('Google OAuth is not configured on the server', 500)
+    throw new ErrorResponse('Máy chủ chưa cấu hình đăng nhập Google.', 500)
   }
 
   const oAuth2Client = new OAuth2Client(clientId, clientSecret, 'postmessage')
@@ -280,7 +280,7 @@ export const googleAuth = asyncHandler(async (req, res) => {
     tokens = tokenResponse.tokens
   } catch (err) {
     console.error('Google token exchange error:', err.message)
-    throw new ErrorResponse('Failed to exchange Google authorization code', 400)
+    throw new ErrorResponse('Không xác thực được với Google. Vui lòng thử lại.', 400)
   }
 
   // Verify the id_token to get user info
@@ -293,14 +293,14 @@ export const googleAuth = asyncHandler(async (req, res) => {
     payload = ticket.getPayload()
   } catch (err) {
     console.error('Google token verification error:', err.message)
-    throw new ErrorResponse('Invalid Google token', 400)
+    throw new ErrorResponse('Mã đăng nhập Google không hợp lệ.', 400)
   }
 
   const { sub: googleId, email: rawEmail, name, picture } = payload
   const email = normalizeEmail(rawEmail)
 
   if (!email) {
-    throw new ErrorResponse('Google account does not have an email', 400)
+    throw new ErrorResponse('Tài khoản Google không có email.', 400)
   }
 
   // Find existing user by googleId or email
@@ -315,7 +315,7 @@ export const googleAuth = asyncHandler(async (req, res) => {
       })
     }
     if (user.accountStatus && user.accountStatus !== 'active') {
-      throw new ErrorResponse('Account is not active', 403)
+      throw new ErrorResponse('Tài khoản chưa được kích hoạt hoặc đã bị khoá.', 403)
     }
     // Link Google account if not already linked
     if (!user.googleId) {
@@ -364,9 +364,9 @@ export const forgotPassword = asyncHandler(async (req, res) => {
   const email = normalizeEmail(rawEmail)
 
   if (!email) {
-    throw new ErrorResponse('Please provide an email address', 400)
+    throw new ErrorResponse('Vui lòng nhập địa chỉ email.', 400)
   }
-  assertStringFields({ email }, 'Please provide an email address')
+  assertStringFields({ email }, 'Vui lòng nhập địa chỉ email.')
 
   const user = await User.findOne({ email })
   const acknowledge = () => res.status(200).json({
@@ -440,12 +440,12 @@ export const resetPassword = asyncHandler(async (req, res) => {
   const email = normalizeEmail(rawEmail)
 
   if (!email || !code || !newPassword) {
-    throw new ErrorResponse('Please provide email, verification code, and new password', 400)
+    throw new ErrorResponse('Vui lòng nhập email, mã xác minh và mật khẩu mới.', 400)
   }
   // Type checks are load-bearing: without them a body of
   // { "email": { "$ne": null }, "code": { "$ne": "" } } matches any account
   // currently inside the reset flow and takes it over without knowing the code.
-  assertStringFields({ email, code, newPassword }, 'Please provide email, verification code, and new password')
+  assertStringFields({ email, code, newPassword }, 'Vui lòng nhập email, mã xác minh và mật khẩu mới.')
 
   const query = User.findOne({
     email,
@@ -457,7 +457,7 @@ export const resetPassword = asyncHandler(async (req, res) => {
     : query)
 
   if (!user) {
-    throw new ErrorResponse('Invalid or expired verification code', 400)
+    throw new ErrorResponse('Mã xác minh không đúng hoặc đã hết hạn.', 400)
   }
 
   // Set new password (will be hashed automatically on save)
@@ -468,7 +468,7 @@ export const resetPassword = asyncHandler(async (req, res) => {
 
   res.status(200).json({
     success: true,
-    message: 'Password reset successful. You can now login with your new password.',
+    message: 'Đặt lại mật khẩu thành công. Bạn có thể đăng nhập bằng mật khẩu mới.',
   })
 })
 
@@ -494,9 +494,9 @@ export const checkEmail = asyncHandler(async (req, res) => {
   const email = normalizeEmail(rawEmail)
 
   if (!email) {
-    throw new ErrorResponse('Please provide an email', 400)
+    throw new ErrorResponse('Vui lòng nhập email.', 400)
   }
-  assertStringFields({ email }, 'Please provide an email')
+  assertStringFields({ email }, 'Vui lòng nhập email.')
 
   res.status(200).json({
     success: true,
@@ -659,7 +659,7 @@ export const logout = asyncHandler(async (req, res) => {
   }
   res.status(200).json({
     success: true,
-    message: 'User logged out successfully',
+    message: 'Đã đăng xuất.',
     data: {},
   })
 })

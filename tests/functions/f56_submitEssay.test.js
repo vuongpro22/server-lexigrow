@@ -41,6 +41,9 @@ vi.mock('../../src/services/aiQuota.js', () => ({
   reserveDailyEssayQuota: vi.fn().mockResolvedValue({ reserved: true, day: '2026-11-10' }),
   settleDailyEssayQuota: vi.fn().mockResolvedValue({ settled: true }),
 }))
+vi.mock('../../src/services/notification.service.js', () => ({
+  createNotification: vi.fn().mockResolvedValue({}),
+}))
 vi.mock('../../src/services/aiQuota.service.js', () => ({
   checkDailyEssayQuota: vi.fn().mockResolvedValue({ canSubmit: true, limit: 3 }),
 }))
@@ -49,6 +52,7 @@ import Essay from '../../src/models/Essay.js'
 import Assignment from '../../src/models/Assignment.js'
 import Class from '../../src/models/Class.js'
 import { reserveDailyEssayQuota } from '../../src/services/aiQuota.js'
+import { createNotification } from '../../src/services/notification.service.js'
 import { submitEssay } from '../../src/controllers/essay.controller.js'
 
 describe('F56: Submit Essay (submitEssay)', () => {
@@ -266,13 +270,13 @@ describe('F56: Submit Essay (submitEssay)', () => {
       return {
         ...doc,
         then: (fn) => Promise.resolve(doc).then(fn),
-        select: vi.fn().mockResolvedValue({ teacher: 'teacher_1' }),
+        select: vi.fn().mockResolvedValue({ teacher: 'teacher_1', name: 'IELTS A' }),
       }
     })
 
     const { req, res, next } = createMockContext({
       params: { id: 'e_sub_7' },
-      user: { _id: 'student_1', role: 'student' },
+      user: { _id: 'student_1', role: 'student', name: 'An' },
     })
 
     await submitEssay(req, res, next)
@@ -281,6 +285,26 @@ describe('F56: Submit Essay (submitEssay)', () => {
     expect(existingEssay.status).toBe('submitted')
     expect(existingEssay.class).toBe('class_valid_7')
     expect(saveMock).toHaveBeenCalled()
+    await vi.waitFor(() => expect(createNotification).toHaveBeenCalledWith(expect.objectContaining({
+      recipient: 'teacher_1',
+      sender: 'student_1',
+      type: 'assignment',
+      link: '/teacher/assignment/assign_valid_7',
+    })))
+  })
+
+  it('does not notify any teacher for a free-writing essay without an assignment', async () => {
+    const existingEssay = {
+      _id: 'e_free', student: 'student_1', status: 'draft',
+      content: Array(60).fill('word').join(' '), wordCount: 60, save: vi.fn().mockResolvedValue(true),
+    }
+    Essay.findById.mockResolvedValue(existingEssay)
+    const { req, res, next } = createMockContext({ params: { id: 'e_free' }, user: { _id: 'student_1', role: 'student' } })
+
+    await submitEssay(req, res, next)
+
+    expect(res.status).toHaveBeenCalledWith(200)
+    expect(createNotification).not.toHaveBeenCalled()
   })
 
   it('UTCID09 (A) [LEARN-23]: should reject submitEssay with 429 DAILY_ESSAY_LIMIT_REACHED when daily quota is exceeded', async () => {

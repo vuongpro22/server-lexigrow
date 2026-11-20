@@ -9,6 +9,7 @@ import ErrorResponse from '../utils/ErrorResponse.js'
 import asyncHandler from '../utils/asyncHandler.js'
 import { canAccessEssay, essayVisibilityFilter, buildTeacherEssayScope } from '../utils/essayAccess.js'
 import { reserveDailyEssayQuota, settleDailyEssayQuota } from '../services/aiQuota.js'
+import { createNotification } from '../services/notification.service.js'
 
 export function stripHtmlToPlainText(content) {
   if (typeof content !== 'string') return ''
@@ -211,6 +212,20 @@ export const updateEssay = asyncHandler(async (req, res) => {
  * @route   PATCH /api/essays/:id/submit
  * @access  Private (student, owner only)
  */
+async function notifyTeacherOfSubmission({ essay, assignment, student }) {
+  const cls = await Class.findById(essay.class).select('teacher name')
+  if (!cls?.teacher) return
+  const isResubmission = (essay.revisionCounter ?? 0) > 0
+  await createNotification({
+    recipient: cls.teacher,
+    sender: student._id,
+    type: 'assignment',
+    title: isResubmission ? 'Học sinh đã nộp lại bài tập' : 'Học sinh đã nộp bài tập',
+    message: `${student.name || 'Học sinh'} đã ${isResubmission ? 'nộp lại' : 'nộp'} bài "${assignment.title}" (lớp ${cls.name}).`,
+    link: `/teacher/assignment/${assignment._id}`,
+  })
+}
+
 export const submitEssay = asyncHandler(async (req, res) => {
   const essay = await Essay.findById(req.params.id)
 
@@ -280,6 +295,14 @@ export const submitEssay = asyncHandler(async (req, res) => {
       await settleDailyEssayQuota({ student: req.user._id, requestId, day: quotaReservation.day, outcome: 'release' })
     }
     throw error
+  }
+
+  // Tell the class teacher an assignment was handed in. Fire-and-forget: a
+  // notification failure must never block or fail the submission itself.
+  if (assignment && essay.class) {
+    notifyTeacherOfSubmission({ essay, assignment, student: req.user }).catch((notifyErr) => {
+      console.error('[Essay Submit] Could not notify teacher of submission:', notifyErr?.message)
+    })
   }
 
   // ── Load teacher's active system prompt (if any) ──
@@ -451,20 +474,19 @@ export const requestRevision = asyncHandler(async (req, res) => {
   essay.status = 'needs_revision'
   await essay.save()
 
-  // Create early warning or standard database notification for the student
+  // Persist a notification for the student. The type must be one of the
+  // Notification enum values, otherwise the create silently fails.
   try {
-    const Notification = (await import('../models/Notification.js')).default
-    if (Notification) {
-      await Notification.create({
-        recipient: essay.student,
-        sender: req.user._id,
-        type: 'early_warning',
-        title: 'Revision Requested',
-        message: `Your teacher requested a revision for essay: "${essay.title}"`,
-        relatedItem: essay._id,
-        onModel: 'Essay'
-      })
-    }
+    await createNotification({
+      recipient: essay.student,
+      sender: req.user._id,
+      type: 'feedback',
+      title: 'Giáo viên yêu cầu sửa bài',
+      message: `Giáo viên yêu cầu bạn chỉnh sửa bài "${essay.title}".`,
+      link: essay.assignment
+        ? `/student/assignment-writing?assignmentId=${essay.assignment}&essayId=${essay._id}`
+        : `/student/feedback?id=${essay._id}`,
+    })
   } catch (notiErr) {
     console.error('Could not create revision notification in database:', notiErr.message)
   }

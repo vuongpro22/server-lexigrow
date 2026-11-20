@@ -258,8 +258,8 @@ export const submitFeedback = asyncHandler(async (req, res) => {
     createNotification({
       recipient: reviewedEssay.student,
       sender: req.user._id,
-      title: 'Teacher Written Feedback',
-      message: `Teacher ${req.user.name} has provided written feedback on your essay "${reviewedEssay.title}".`,
+      title: 'Nhận xét mới từ giáo viên',
+      message: `Giáo viên ${req.user.name} đã nhận xét bài "${reviewedEssay.title}" của bạn.`,
       type: 'feedback',
       link: `/student/feedback?id=${reviewedEssay._id}`,
     }).catch(err => {

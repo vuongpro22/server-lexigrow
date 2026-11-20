@@ -234,15 +234,29 @@ export const createPayment = asyncHandler(async (req, res) => {
     throw new ErrorResponse('Gói cước miễn phí không cần thanh toán.', 400)
   }
 
-  if (req.user.role === 'parent') {
+  // Never sell a plan below the beneficiary's current effective tier: the
+  // lower subscription would add no benefit and only charge the user. This
+  // applies to every payer (student, teacher, or parent buying for a child).
+  {
+    const buyingForChild = req.user.role === 'parent'
     const currentTier = await getUserEffectiveTier(targetUser)
     const currentRank = tierRank(currentTier?.tier)
     const planRank = tierRank(plan.tier)
     if (planRank < currentRank) {
-      throw new ErrorResponse('Gói này thấp hơn gói hiện tại của con.', 400, 'PLAN_NOT_AN_UPGRADE')
+      throw new ErrorResponse(
+        buyingForChild ? 'Gói này thấp hơn gói hiện tại của con.' : 'Gói này thấp hơn gói bạn đang sử dụng.',
+        400,
+        'PLAN_NOT_AN_UPGRADE',
+      )
     }
     if (planRank === currentRank && currentTier?.source === 'teacher_sponsored') {
-      throw new ErrorResponse('Con đang được giáo viên tài trợ ở gói này. Chỉ gói cao hơn mới thêm quyền lợi.', 400, 'PLAN_ALREADY_SPONSORED')
+      throw new ErrorResponse(
+        buyingForChild
+          ? 'Con đang được giáo viên tài trợ ở gói này. Chỉ gói cao hơn mới thêm quyền lợi.'
+          : 'Bạn đang được giáo viên tài trợ ở gói này. Chỉ gói cao hơn mới thêm quyền lợi.',
+        400,
+        'PLAN_ALREADY_SPONSORED',
+      )
     }
   }
 
@@ -349,16 +363,16 @@ async function notifySubscriptionActivated(claimed, subscription) {
           {
             recipient: claimed.user,
             sender: claimed.purchasedBy,
-            title: 'Learning plan upgraded',
-            message: `Your parent upgraded your plan to ${claimed.planName}.`,
+            title: 'Gói học đã được nâng cấp',
+            message: `Phụ huynh đã nâng cấp gói của bạn lên ${claimed.planName}.`,
             type: 'system',
             link: '/student/dashboard',
           },
           {
             recipient: claimed.purchasedBy,
             sender: null,
-            title: 'Payment successful',
-            message: `The ${claimed.planName} plan is now active for your child.`,
+            title: 'Thanh toán thành công',
+            message: `Gói ${claimed.planName} đã được kích hoạt cho con.`,
             type: 'system',
             link: '/parent/plans',
           },
@@ -367,8 +381,8 @@ async function notifySubscriptionActivated(claimed, subscription) {
           {
             recipient: claimed.user,
             sender: null,
-            title: 'Subscription activated',
-            message: `Your ${claimed.planName} plan is now active${subscription.endDate ? ` until ${new Date(subscription.endDate).toLocaleDateString('en-GB')}` : ''}.`,
+            title: 'Gói cước đã được kích hoạt',
+            message: `Gói ${claimed.planName} đã được kích hoạt${subscription.endDate ? ` đến ngày ${new Date(subscription.endDate).toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}` : ''}.`,
             type: 'system',
             link: claimed.targetRole === 'teacher' ? '/teacher/dashboard' : '/student/dashboard',
           },

@@ -70,6 +70,9 @@ const aiAnalysisSchema = new mongoose.Schema({
     c2: { type: Number, default: 0 },
     awl: { type: Number, default: 0 },
     advancedPercentage: { type: Number, default: 0 },
+    matchedWords: { type: Number, default: null },
+    uniqueWords: { type: Number, default: null },
+    coverage: { type: Number, default: null },
   },
   overallScore: {
     type: Number,

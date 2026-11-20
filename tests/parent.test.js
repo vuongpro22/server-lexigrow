@@ -428,12 +428,14 @@ describe('Parent API', () => {
       { student: child, relationship: 'mother' },
     ]))
     getMasteredWords.mockResolvedValue(new Set(['alpha', 'beta']))
-    Vocabulary.countDocuments
-      .mockResolvedValueOnce(6)
-      .mockResolvedValueOnce(3)
-    Vocabulary.find.mockReturnValueOnce(
-      mockQuery(Array.from({ length: 6 }, (_, i) => ({ word: `word_${i}`, reviewCount: 1 })))
-    )
+    // Learned-word counts: 6 in the current week, 3 in the previous week.
+    const monday = new Date()
+    monday.setDate(monday.getDate() + (monday.getDay() === 0 ? -6 : 1 - monday.getDay()))
+    monday.setHours(0, 0, 0, 0)
+    Vocabulary.find.mockImplementation(query => {
+      const count = query.createdAt.$lte < monday ? 3 : 6
+      return mockQuery(Array.from({ length: count }, (_, i) => ({ word: `word_${count}_${i}`, reviewCount: 1 })))
+    })
     Essay.find
       .mockReturnValueOnce(mockQuery([
         { _id: 'essay_new', title: 'Recent Essay', status: 'reviewed', submittedAt: new Date('2026-07-20') },

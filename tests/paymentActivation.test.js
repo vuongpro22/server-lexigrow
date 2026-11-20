@@ -145,12 +145,12 @@ describe('PayOS transaction activation', () => {
       expect.objectContaining({
         recipient: 'user-1',
         sender: 'parent-1',
-        title: 'Learning plan upgraded',
+        title: 'Gói học đã được nâng cấp',
         link: '/student/dashboard',
       }),
       expect.objectContaining({
         recipient: 'parent-1',
-        title: 'Payment successful',
+        title: 'Thanh toán thành công',
         link: '/parent/plans',
       }),
     ])

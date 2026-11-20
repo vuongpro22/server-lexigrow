@@ -98,7 +98,7 @@ describe('Assignment due date validation', () => {
       .send({ dueDate: '2020-01-01T00:00:00.000Z' })
       .expect(400)
 
-    expect(res.body.error).toContain('future')
+    expect(res.body.error).toContain('tương lai')
   })
 
   it('rejects creating an assignment for an archived class', async () => {
@@ -118,7 +118,7 @@ describe('Assignment due date validation', () => {
       .expect(400)
 
     expect(res.body.success).toBe(false)
-    expect(res.body.error).toContain('archived')
+    expect(res.body.error).toContain('đã lưu trữ')
     expect(Assignment.create).not.toHaveBeenCalled()
   })
 
